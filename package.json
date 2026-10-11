@@ -1,0 +1,21 @@
+{
+  "name": "malikgpt-unified-chat",
+  "version": "1.0.0",
+  "description": "MalikGPT Unified Multi-Platform Stream Chat Aggregator and OBS Overlay",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/normalizer.test.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "youtubei.js": "^10.0.0",
+    "tmi.js": "^1.8.5",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: malikgpt-unified-chat
+    env: node
+    buildCommand: "npm install && pip install -r requirements.txt"
+    startCommand: "npm start"
+    envVars:
+      - key: DASHBOARD_PASS
+        generateValue: true
+      - key: NODE_ENV
+        value: production

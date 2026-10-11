@@ -1,0 +1,2 @@
+TikTokLive==6.2.2
+requests==2.32.3
