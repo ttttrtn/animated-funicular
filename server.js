@@ -23,7 +23,7 @@ const activeAdapters = {
   youtube: { status: 'disconnected', handle: '', instance: null },
   tiktok: { status: 'disconnected', handle: '', process: null },
   twitch: { status: 'disconnected', handle: '', client: null },
-  kick: { status: 'disconnected', handle: '', instance: null, timer: null },
+  kick: { status: 'disconnected', handle: '', process: null },
   facebook: { status: 'disconnected', handle: '', timer: null },
   rumble: { status: 'disconnected', handle: '', timer: null }
 };
@@ -131,88 +131,35 @@ function connectTwitch(channel) {
   activeAdapters.twitch.client = client;
 }
 
-// 4. Kick Chat Adapter (Stable Resilient Stream & Fallback Handler)
-async function connectKick(slug) {
+// 4. Kick Chat Adapter (Python Subprocess with TLS Fingerprinting via curl_cffi)
+function connectKick(slug) {
   disconnectPlatform('kick');
   updatePlatformStatus('kick', 'connecting', slug);
-
   const cleanSlug = slug.toLowerCase().trim();
-  
-  // High-performance pre-resolved chatroom lookup dictionary to avoid Cloudflare drops
-  const knownChatroomIds = {
-    'xqc': 668,
-    'adinross': 1234,
-    'trainwreckstv': 555,
-    'ishowspeed': 7890
-  };
 
-  let chatroomId = knownChatroomIds[cleanSlug];
+  const pythonProc = spawn('python3', [path.join(__dirname, 'python', 'kick_bridge.py'), cleanSlug]);
+  activeAdapters.kick.process = pythonProc;
 
-  if (!chatroomId) {
-    try {
-      const res = await axios.get(`https://kick.com/api/v2/channels/${cleanSlug}`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          'Accept': 'application/json',
-          'Referer': 'https://kick.com/'
-        },
-        timeout: 4000
-      });
-      chatroomId = res.data?.chatroom?.id;
-    } catch (e) {
-      chatroomId = 668; // Default fallback room ID
-    }
-  }
-
-  function startKickStream() {
-    if (activeAdapters.kick.status === 'disconnected') return;
-
-    const ws = new WebSocket('wss://ws-us2.pusher.com/app/eb1d5f283082f78b92c9?protocol=7&client=js&version=7.4.0&flash=false');
-
-    ws.on('open', () => {
-      updatePlatformStatus('kick', 'connected', cleanSlug);
-      ws.send(JSON.stringify({
-        event: 'pusher:subscribe',
-        data: { channel: `chatrooms.${chatroomId}.v2` }
-      }));
-    });
-
-    ws.on('message', (data) => {
+  pythonProc.stdout.on('data', (data) => {
+    const lines = data.toString().split('\n');
+    lines.forEach((line) => {
+      if (!line.trim()) return;
       try {
-        const parsed = JSON.parse(data.toString());
-
-        if (parsed.event === 'pusher:ping') {
-          ws.send(JSON.stringify({ event: 'pusher:pong', data: {} }));
-          return;
-        }
-
-        if (parsed.event && parsed.event.includes('ChatMessageEvent')) {
-          const payload = JSON.parse(parsed.data);
-          const author = payload.sender?.username || 'KickViewer';
-          const message = payload.content || '';
-          const id = payload.id || null;
-          if (message) {
-            broadcastMessage(normalizeMessage('kick', author, message, '', id));
-          }
+        const payload = JSON.parse(line);
+        if (payload.type === 'status') {
+          updatePlatformStatus('kick', payload.status, cleanSlug);
+        } else if (payload.type === 'message') {
+          broadcastMessage(normalizeMessage('kick', payload.username, payload.message, '', payload.id));
+        } else if (payload.type === 'error') {
+          updatePlatformStatus('kick', 'error', payload.message);
         }
       } catch (e) {}
     });
+  });
 
-    ws.on('error', () => {
-      updatePlatformStatus('kick', 'connecting', 'Reconnecting...');
-    });
-
-    ws.on('close', () => {
-      if (activeAdapters.kick.status !== 'disconnected') {
-        updatePlatformStatus('kick', 'connecting', cleanSlug);
-        activeAdapters.kick.timer = setTimeout(startKickStream, 3000);
-      }
-    });
-
-    activeAdapters.kick.instance = ws;
-  }
-
-  startKickStream();
+  pythonProc.on('close', () => {
+    updatePlatformStatus('kick', 'disconnected');
+  });
 }
 
 // 5. Facebook Live Adapter
@@ -236,12 +183,8 @@ function disconnectPlatform(platform) {
   if (!adapter) return;
 
   if (platform === 'youtube' && adapter.instance) { try { adapter.instance.stop(); } catch (e) {} }
-  else if (platform === 'tiktok' && adapter.process) { try { adapter.process.kill(); } catch (e) {} }
+  else if ((platform === 'tiktok' || platform === 'kick') && adapter.process) { try { adapter.process.kill(); } catch (e) {} }
   else if (platform === 'twitch' && adapter.client) { try { adapter.client.disconnect(); } catch (e) {} }
-  else if (platform === 'kick') {
-    if (adapter.timer) clearTimeout(adapter.timer);
-    if (adapter.instance) { try { adapter.instance.close(); } catch (e) {} }
-  }
   else if (adapter.timer) { clearInterval(adapter.timer); }
 
   activeAdapters[platform] = { status: 'disconnected', handle: '', instance: null, process: null, client: null, timer: null };
