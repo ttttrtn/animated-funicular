@@ -3,6 +3,7 @@ const container = document.getElementById('overlayChatContainer');
 const params = new URLSearchParams(window.location.search);
 const maxMessages = parseInt(params.get('maxMessages') || '8', 10);
 const fontSize = params.get('fontSize') || '15px';
+const showBadges = params.get('badges') !== '0'; // add &badges=0 to hide badges
 
 // ---- Connect platforms from the URL ---------------------------------------
 // /overlay.html?twitch=NAME&kick=NAME&youtube=@HANDLE&tiktok=NAME&rumble=URL_OR_KEY
@@ -26,9 +27,65 @@ function nameColor(name) {
   return `hsl(${h % 360}, 90%, 65%)`;
 }
 
-// The server escapes < and >. Turn them back into plain text; we only ever
+// The server HTML-escapes text. Turn it back into plain text; we only ever
 // insert with textContent, so nothing a viewer types is parsed as HTML.
-const decode = (s) => String(s || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+// (&amp; must be decoded last.)
+const decode = (s) =>
+  String(s || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+
+// Fallback icons for badges that come without an image (Kick, some TikTok/YouTube).
+// Unknown types without an image are not shown.
+const BADGE_ICONS = {
+  broadcaster: '🎙️',
+  owner: '👑',
+  moderator: '🔧',
+  vip: '💎',
+  subscriber: '⭐',
+  member: '⭐',
+  verified: '✔️',
+  founder: '🏅',
+  og: '🏅',
+  staff: '🛡️',
+  admin: '🛡️',
+  sub_gifter: '🎁',
+  fans: '💗'
+};
+
+function buildBadges(list) {
+  if (!showBadges || !Array.isArray(list) || !list.length) return null;
+  const wrap = document.createElement('span');
+  wrap.className = 'badges';
+
+  for (const b of list.slice(0, 6)) {
+    if (!b) continue;
+    const type = String(b.type || '').replace(/[^a-z0-9_-]/g, '');
+    const label = decode(b.label || type);
+    let el = null;
+
+    if (typeof b.url === 'string' && /^https:\/\//i.test(b.url)) {
+      el = document.createElement('img');
+      el.className = 'badge';
+      el.src = b.url;
+      el.alt = label;
+      el.onerror = () => el.remove();
+    } else if (BADGE_ICONS[type]) {
+      el = document.createElement('span');
+      el.className = 'badge-icon';
+      el.textContent = BADGE_ICONS[type];
+    }
+
+    if (!el) continue;
+    el.title = label;
+    if (type) el.classList.add(`badge-${type}`);
+    wrap.appendChild(el);
+  }
+  return wrap.children.length ? wrap : null;
+}
 
 const seen = new Set();
 socket.on('chatMessage', (msg) => {
@@ -47,6 +104,8 @@ socket.on('chatMessage', (msg) => {
   icon.src = `/icons/${String(msg.platform).replace(/[^a-z]/g, '')}.svg`;
   icon.onerror = () => icon.remove();
 
+  const badges = buildBadges(msg.badges);
+
   const name = document.createElement('span');
   name.className = 'username';
   name.style.color = nameColor(msg.username);
@@ -56,7 +115,9 @@ socket.on('chatMessage', (msg) => {
   text.className = 'text';
   text.textContent = decode(msg.message);
 
-  row.append(icon, name, text);
+  row.append(icon);
+  if (badges) row.append(badges);
+  row.append(name, text);
   container.appendChild(row);
   while (container.children.length > maxMessages) container.removeChild(container.firstChild);
 });
