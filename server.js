@@ -57,9 +57,22 @@ function makeSeen(limit) {
   };
 }
 
-// Kick webhook needs the RAW body for signature checking, so it must be
-// registered before the JSON parser.
+// ---------------------------------------------------------------------------
+// Webhooks. These need the RAW request body for signature checking, so they
+// must be registered BEFORE the JSON parser below.
+// ---------------------------------------------------------------------------
 app.post('/webhooks/kick', express.raw({ type: '*/*', limit: '200kb' }), (req, res) => handleKickWebhook(req, res));
+
+// X live chat via the official Activity API (own broadcasts only). Adds
+// GET + POST /webhooks/x. The wrapper around broadcastMessage is needed
+// because that const is defined further down in this file.
+require('./adapters/xwebhook').init({
+  app,
+  express,
+  normalizeMessage,
+  makeSeen,
+  broadcastMessage: (m) => broadcastMessage(m)
+});
 
 app.use(express.json({ limit: '10kb' }));
 app.get(['/overlay', '/overlay/', '/overlay.html', '/overlay.html/'], (_req, res) => {
@@ -1190,14 +1203,6 @@ async function connectRumble(input) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Facebook: not implemented. Reports that honestly instead of faking it.
-// ---------------------------------------------------------------------------
-function connectUnsupported(platform, handle) {
-  disconnectPlatform(platform);
-  updatePlatformStatus(platform, 'error', String(handle || ''), `${platform} chat is not implemented yet`);
-}
-
-// ---------------------------------------------------------------------------
 // Disconnect
 // ---------------------------------------------------------------------------
 function disconnectPlatform(platform, { silent = false } = {}) {
@@ -1229,6 +1234,7 @@ function requireAuth(req, res, next) {
 }
 
 // X, Facebook and Instagram live in adapters/ (see the comment at the top of each file).
+// X chat is also available through the official Activity API webhook (adapters/xwebhook.js).
 const adapterCtx = { activeAdapters, updatePlatformStatus, normalizeMessage, broadcastMessage, makeSeen, disconnectPlatform };
 const xAdapter = require('./adapters/x').init(adapterCtx);
 const fbAdapter = require('./adapters/facebook').init(adapterCtx);
@@ -1256,9 +1262,10 @@ app.post('/api/connect', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
-// Pops out the Instagram login window on the machine running this server.
+// Kept for the dashboard's Instagram login button. Instagram runs in official-API
+// mode now, so openLogin does nothing and just reports success.
 app.post('/api/instagram/login', requireAuth, (_req, res) => {
-  igAdapter.openLogin()
+  Promise.resolve(igAdapter.openLogin?.())
     .then(() => res.json({ success: true }))
     .catch((err) => res.status(500).json({ error: String(err?.message || err) }));
 });
@@ -1331,7 +1338,7 @@ io.on('connection', (socket) => {
 // ---------------------------------------------------------------------------
 // Start / shutdown
 // ---------------------------------------------------------------------------
-server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: platforms-v5]`));
+server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: platforms-v6]`));
 
 function shutdown() {
   console.log('Shutting down, stopping adapters...');
