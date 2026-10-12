@@ -249,7 +249,14 @@ function init(ctx) {
       const tick = async () => {
         if (stopped || !current()) return;
         try {
-          const raw = await fetchHistory(b, 0, false);
+          // Ask both ways the reference client does and merge (deduped by uuid).
+          const [qa, qb] = await Promise.all([
+            fetchHistory(b, 0, true).catch((e) => { dbg('history quick_get=true failed:', e?.message || e); return []; }),
+            fetchHistory(b, 0, false).catch((e) => { dbg('history quick_get=false failed:', e?.message || e); return []; })
+          ]);
+          const raw = [...qa, ...qb];
+          if (DEBUG() && first) console.log('[X][debug] first history item:', JSON.stringify(raw[0] || null).slice(0, 600));
+          dbg(`history sizes: quick_get=true -> ${qa.length}, quick_get=false -> ${qb.length}`);
           let fresh = 0;
           for (const f of raw) {
             const m = parseChatFrame(f, b.broadcastId);
