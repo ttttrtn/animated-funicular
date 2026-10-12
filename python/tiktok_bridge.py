@@ -1,341 +1,1323 @@
-import sys
-import re
-import json
-import time
-import uuid
-import asyncio
+'use strict';
+require('dotenv').config();
 
-from TikTokLive import TikTokLiveClient
-from TikTokLive.events import ConnectEvent, DisconnectEvent, CommentEvent, GiftEvent
+const express = require('express');
+const http = require('http');
+const crypto = require('crypto');
+const path = require('path');
+const { Server } = require('socket.io');
+const { spawn } = require('child_process');
+const tmi = require('tmi.js');
 
-if len(sys.argv) < 2:
-    print(json.dumps({"type": "error", "message": "No TikTok username provided", "fatal": True}), flush=True)
-    sys.exit(1)
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
-username = sys.argv[1].replace("@", "").strip()
+const PORT = process.env.PORT || 3000;
+const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
 
-OFFLINE_RETRY_S = 30      # streamer not live yet: check again every 30s
-ERROR_RETRY_MIN_S = 5
-ERROR_RETRY_MAX_S = 120
-BADGE_DEBUG_LIMIT = 3     # log the raw badge structure for the first few chat events
+// ---------------------------------------------------------------------------
+// Auth: password from the environment only. If DASHBOARD_PASS is not set, a
+// random one is generated and printed once.
+// ---------------------------------------------------------------------------
+let DASHBOARD_PASS = process.env.DASHBOARD_PASS;
+if (!DASHBOARD_PASS) {
+  DASHBOARD_PASS = crypto.randomBytes(9).toString('base64url');
+  console.warn(`[Auth] DASHBOARD_PASS not set. Temporary password for this run: ${DASHBOARD_PASS}`);
+}
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
+const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
+const passOk = (given) => safeEqual(given, DASHBOARD_PASS);
 
+// Simple brute-force limiter for the password-protected endpoints.
+const AUTH_MAX_FAILS = 10;
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
+const authFails = new Map(); // ip -> { count, resetAt }
 
-def emit(obj):
-    print(json.dumps(obj), flush=True)  # ensure_ascii keeps emoji safe on any console
+function authBlocked(ip) {
+  const f = authFails.get(ip);
+  if (!f) return false;
+  if (Date.now() > f.resetAt) { authFails.delete(ip); return false; }
+  return f.count >= AUTH_MAX_FAILS;
+}
+function authFailed(ip) {
+  const f = authFails.get(ip);
+  if (!f || Date.now() > f.resetAt) authFails.set(ip, { count: 1, resetAt: Date.now() + AUTH_WINDOW_MS });
+  else f.count += 1;
+}
 
+// Small bounded "already seen" set used for de-duplicating chat messages.
+function makeSeen(limit) {
+  const set = new Set();
+  return (id) => {
+    if (set.has(id)) return true;
+    set.add(id);
+    if (set.size > limit) set.delete(set.values().next().value);
+    return false;
+  };
+}
 
-def log(msg):
-    emit({"type": "log", "message": msg})
+// Kick webhook needs the RAW body for signature checking, so it must be
+// registered before the JSON parser.
+app.post('/webhooks/kick', express.raw({ type: '*/*', limit: '200kb' }), (req, res) => handleKickWebhook(req, res));
 
+app.use(express.json({ limit: '10kb' }));
+app.get(['/overlay', '/overlay/', '/overlay.html', '/overlay.html/'], (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'overlay.html'));
+});
+app.use(express.static(path.join(__dirname, 'public')));
 
-def status(s):
-    emit({"type": "status", "status": s, "handle": username, "username": username})
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const PLATFORMS = ['youtube', 'tiktok', 'twitch', 'kick', 'facebook', 'rumble'];
 
+const blankAdapter = () => ({
+  status: 'disconnected',
+  handle: '',
+  error: '',
+  instance: null,
+  process: null,
+  client: null,
+  timer: null,
+  retry: null,
+  token: null
+});
 
-def avatar_of(user):
-    for attr in ("avatar_thumb", "avatar_medium", "avatar_large"):
-        img = getattr(user, attr, None)
-        urls = getattr(img, "url_list", None) if img else None
-        if urls:
-            return str(urls[0])
-    return ""
+const activeAdapters = Object.fromEntries(PLATFORMS.map((p) => [p, blankAdapter()]));
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+const escapeHtml = (v) =>
+  String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-def message_id(event):
-    common = getattr(event, "common", None)
-    mid = getattr(common, "msg_id", None)
-    return f"tiktok-{mid}" if mid else f"tiktok-{uuid.uuid4().hex[:12]}"
+// Only allow http(s) avatars or local icons (blocks javascript:/data: URLs).
+function safeAvatar(url, platform) {
+  const fallback = `/icons/${platform}.svg`;
+  if (typeof url !== 'string' || !url) return fallback;
+  return /^https:\/\//i.test(url) || /^\/[\w./-]+$/.test(url) ? url : fallback;
+}
 
+// Badges: [{ type, label, url }]. `type` is a lowercase slug the overlay can
+// style (broadcaster, owner, moderator, vip, subscriber, member, verified, ...);
+// `url` is an https image when the platform provides one, otherwise ''.
+function cleanBadges(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .slice(0, 6)
+    .map((b) => {
+      const o = typeof b === 'string' ? { type: b } : b;
+      if (!o || typeof o !== 'object') return null;
+      const type = String(o.type || o.name || 'badge').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 30) || 'badge';
+      const label = escapeHtml(String(o.label || o.text || o.title || type).slice(0, 40));
+      const url = typeof o.url === 'string' && (/^https:\/\//i.test(o.url) || /^\/icons\/(?:[\w-]+\/)*[\w-]+\.svg$/.test(o.url)) ? o.url : '';
+      return { type, label, url };
+    })
+    .filter(Boolean);
+}
 
-def display_name(user):
-    return (getattr(user, "nickname", "") or getattr(user, "unique_id", "") or "TikTok user")
+function normalizeMessage(platform, username, message, avatar = '', id = null, badges = []) {
+  const p = platform.toLowerCase();
+  return {
+    id: id || `${p}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+    platform: p,
+    username: escapeHtml(username || 'Anonymous'),
+    message: escapeHtml(message || ''),
+    avatar: safeAvatar(avatar, p),
+    badges: cleanBadges(badges),
+    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  };
+}
 
+const broadcastMessage = (msg) => io.emit('chatMessage', msg);
 
-# ---------------------------------------------------------------------------
-# Badges.
-#
-# TikTokLive (v6.x, betterproto2) exposes badges as `user.badge_list`, a list
-# of BadgeStruct. (`user.badges` is only a legacy alias of the same list.)
-# A BadgeStruct has:
-#   badge_scene            enum  (NOT "badge_scene_type")
-#   image_badge.image      ImageModel  -> url_list / uri
-#   text_badge             .default_pattern
-#   string_badge           string badge
-#   combine_badge_struct   .icon (ImageModel) + .text  (fan club, gifter level)
-# Depending on the generated proto version the content fields can also be named
-# image / text / str / combine (a protobuf oneof), so both spellings are tried.
-# Every access is defensive: one missing attribute must never kill a chat event.
-# ---------------------------------------------------------------------------
-_badge_debug_left = BADGE_DEBUG_LIMIT
+// For status "error" the message is also sent in `handle` so existing
+// dashboards that display `handle` keep working; `error` is the clean field.
+function updatePlatformStatus(platform, status, handle = '', error = '') {
+  const a = activeAdapters[platform];
+  a.status = status;
+  if (handle) a.handle = handle;
+  a.error = status === 'error' ? error || handle : '';
+  io.emit('statusUpdate', snapshot(platform));
+}
 
+function snapshot(platform) {
+  const a = activeAdapters[platform];
+  return { platform, status: a.status, handle: a.status === 'error' ? a.error : a.handle, error: a.error };
+}
 
-def _safe(obj, name, default=None):
-    try:
-        v = getattr(obj, name, default)
-    except Exception:
-        return default
-    return default if callable(v) else v
+// ---------------------------------------------------------------------------
+// Generic Python bridge runner (used by TikTok)
+// Bridge protocol: one JSON object per stdout line:
+//   {type:'log'|'status'|'message'|'error', ...}
+// ---------------------------------------------------------------------------
+const BRIDGE_MAX_RETRIES = 8;
 
+function startBridge(platform, script, arg, attempt = 0) {
+  const label = platform[0].toUpperCase() + platform.slice(1);
+  const adapter = activeAdapters[platform];
+  clearTimeout(adapter.retry);
 
-def _first_attr(obj, *names):
-    for n in names:
-        v = _safe(obj, n)
-        if v is not None:
-            return v
-    return None
+  updatePlatformStatus(platform, 'connecting', arg);
+  console.log(`[${label}] Spawning Python bridge for "${arg}" (attempt ${attempt + 1})`);
 
+  const proc = spawn(PYTHON_BIN, ['-u', path.join(__dirname, 'python', script), arg], {
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  adapter.process = proc;
 
-def _scene_name(scene):
-    """Badge scene as a lowercase string (enum name if available)."""
-    if scene is None:
-        return ""
-    name = getattr(scene, "name", None)
-    return str(name if name else scene).lower()
+  const isCurrent = () => activeAdapters[platform].process === proc;
+  let fatal = false;
+  let buffer = '';
 
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    let p;
+    try {
+      p = JSON.parse(line);
+    } catch {
+      console.log(`[${label} Raw Out] ${line}`);
+      return;
+    }
+    if (!isCurrent()) return;
 
-def _image_info(img):
-    """(https url, uri) of an ImageModel; ('', '') if there is none."""
-    if img is None:
-        return "", ""
-    url = ""
-    for u in _safe(img, "url_list") or []:
-        u = str(u)
-        if u.startswith("https://"):
-            url = u
-        elif u.startswith("http://"):
-            url = "https://" + u[7:]   # TikTok CDNs serve https; the server only accepts https
-        elif u.startswith("//"):
-            url = "https:" + u
-        if url:
-            break
-    return url, str(_safe(img, "uri", "") or "")
+    switch (p.type) {
+      case 'log':
+        console.log(`[${label} Bridge] ${p.message}`);
+        break;
+      case 'status':
+        console.log(`[${label} Status] ${p.status} (${p.handle || arg})`);
+        if (p.status === 'connected') attempt = 0;
+        updatePlatformStatus(platform, p.status, arg);
+        break;
+      case 'message':
+        try {
+          broadcastMessage(normalizeMessage(platform, p.username, p.message, p.avatar || '', p.id, p.badges));
+        } catch (err) {
+          console.error(`[${label}] broadcast failed:`, err);
+        }
+        break;
+      case 'error':
+        console.error(`[${label} Error] ${p.message}`);
+        if (p.fatal) fatal = true;
+        updatePlatformStatus(platform, 'error', arg, p.message);
+        break;
+    }
+  };
 
+  proc.stdout.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    lines.forEach(handleLine);
+  });
 
-def _classify(*hints):
-    """Map scene name / image uri / text to a type the overlay can style."""
-    h = " ".join(str(x).lower() for x in hints if x)
-    if "moderator" in h or "admin" in h:
-        return "moderator"
-    if "subscri" in h:
-        return "subscriber"
-    if "gifter" in h or "rank" in h or "grade" in h or "pay_" in h:
-        return "gifter"
-    if "fans" in h or "fanclub" in h or "member" in h:
-        return "fan"
-    return ""
+  proc.stderr.on('data', (d) => console.error(`[${label} Python Stderr] ${d.toString().trimEnd()}`));
 
+  proc.on('error', (err) => {
+    console.error(`[${label}] Could not start "${PYTHON_BIN}": ${err.message}`);
+    if (isCurrent()) updatePlatformStatus(platform, 'error', arg, `Cannot start Python (${err.code || err.message})`);
+  });
 
-def _extract_badge(b):
-    """One BadgeStruct -> (scene, url, uri, text)."""
-    scene = _scene_name(_first_attr(b, "badge_scene", "badge_scene_type"))
-    url = uri = text = ""
+  proc.on('close', (code, signal) => {
+    if (buffer.trim()) { handleLine(buffer); buffer = ''; }
+    console.log(`[${label}] Bridge exited (code=${code}, signal=${signal})`);
+    if (!isCurrent()) return; // killed by reconnect/disconnect
 
-    img = _first_attr(b, "image_badge", "image")
-    if img is not None:
-        url, uri = _image_info(_safe(img, "image") or img)
+    adapter.process = null;
+    if (adapter.status !== 'error') updatePlatformStatus(platform, 'disconnected');
 
-    tb = _first_attr(b, "text_badge", "text")
-    if tb is not None:
-        text = str(_safe(tb, "default_pattern", "") or "")
+    if (!fatal && attempt < BRIDGE_MAX_RETRIES) {
+      const delay = Math.min(2000 * 2 ** attempt, 60000);
+      console.log(`[${label}] Reconnecting in ${delay / 1000}s...`);
+      adapter.retry = setTimeout(() => startBridge(platform, script, arg, attempt + 1), delay);
+    }
+  });
+}
 
-    sb = _first_attr(b, "string_badge", "str")
-    if sb is not None and not text:
-        text = sb if isinstance(sb, str) else str(_safe(sb, "str", "") or "")
+// ---------------------------------------------------------------------------
+// 1. YouTube: @handle, channel URL/ID, or video URL/ID.
+// Handle/channel: finds the channel's current live stream, re-checks every
+// 30 s, and reconnects by itself for the next stream. Errors are retried.
+// ---------------------------------------------------------------------------
+const YT_RETRY_MS = 30000;
+const YT_VIDEO_ID = /^[\w-]{11}$/;
+let ytClientPromise = null;
 
-    cb = _first_attr(b, "combine_badge_struct", "combine")
-    if cb is not None:
-        if not url:
-            url, uri = _image_info(_safe(cb, "icon"))
-        if not text:
-            t = _safe(cb, "text")
-            text = str(_safe(t, "default_pattern", "") or _safe(cb, "str", "") or "")
+// youtubei.js is ESM-only, so it has to be imported dynamically.
+function getInnertube(fresh = false) {
+  if (fresh) ytClientPromise = null;
+  if (!ytClientPromise) {
+    ytClientPromise = import('youtubei.js')
+      .then((m) => {
+        try { m.Log?.setLevel(m.Log.Level.NONE); } catch {}
+        return m.Innertube.create({ retrieve_player: false });
+      })
+      .catch((err) => { ytClientPromise = null; throw err; });
+  }
+  return ytClientPromise;
+}
 
-    if "{" in text:       # unresolved template such as "{0:string}"
-        text = ""
-    return scene, url, uri, text
+const codeErr = (code, message) => Object.assign(new Error(message), { code });
 
+function youTubeTargets(input) {
+  const s = String(input || '').trim();
+  const handle = (h) => ({ type: 'handle', value: h, label: `@${h}` });
+  const video = (v) => ({ type: 'video', value: v, label: v });
+  const channel = (c) => ({ type: 'channel', value: c, label: c });
+  if (!s) return [];
 
-def badges_of(user):
-    global _badge_debug_left
-    out, seen = [], set()
+  if (/^https?:\/\//i.test(s) || /^(www\.|m\.)?(youtube\.com|youtu\.be)\//i.test(s)) {
+    let u;
+    try { u = new URL(/^https?:/i.test(s) ? s : `https://${s}`); } catch { return []; }
+    const host = u.hostname.replace(/^(www\.|m\.)/, '');
+    if (host === 'youtu.be') {
+      const id = u.pathname.slice(1).split('/')[0];
+      return YT_VIDEO_ID.test(id) ? [video(id)] : [];
+    }
+    if (!host.endsWith('youtube.com')) return [];
+    const v = u.searchParams.get('v');
+    if (v && YT_VIDEO_ID.test(v)) return [video(v)];
+    let m = u.pathname.match(/^\/(?:live|embed|shorts)\/([\w-]{11})/);
+    if (m) return [video(m[1])];
+    m = u.pathname.match(/^\/@([\w.-]+)/);
+    if (m) return [handle(m[1])];
+    m = u.pathname.match(/^\/channel\/(UC[\w-]{22})/);
+    if (m) return [channel(m[1])];
+    return [];
+  }
 
-    def add(kind, label="", url="", uri=""):
-        key = uri or url or kind
-        if (kind, key) in seen:
-            return
-        # A role we already know from a property (moderator, subscriber, ...)
-        # is upgraded in place when the real image badge shows up, never doubled.
-        for existing in out:
-            if existing["type"] == kind and not existing["url"] and kind != "badge":
-                if url:
-                    existing["url"] = url
-                    existing["label"] = existing["label"] if label in ("", kind) else label
-                seen.add((kind, key))
-                return
-        if len(out) >= 6:
-            return
-        seen.add((kind, key))
-        out.append({"type": kind, "label": label or kind, "url": url})
+  if (s.startsWith('@')) return /^@[\w.-]{3,30}$/.test(s) ? [handle(s.slice(1))] : [];
+  if (/^UC[\w-]{22}$/.test(s)) return [channel(s)];
+  if (YT_VIDEO_ID.test(s)) {
+    // 11 chars can be a video ID or a short handle. Real IDs usually contain A-Z, "-" or "_".
+    return /[A-Z_-]/.test(s) ? [video(s), handle(s)] : [handle(s), video(s)];
+  }
+  if (/^[\w.-]{3,30}$/.test(s)) return [handle(s)];
+  return [];
+}
 
-    handle = str(_safe(user, "unique_id", "") or _safe(user, "display_id", "") or "")
-    if handle and handle.lower() == username.lower():
-        add("broadcaster", "Streamer")
-    if _safe(user, "is_moderator", False) is True:
-        add("moderator", "Moderator")
-    if _safe(user, "is_subscriber", False) is True:
-        add("subscriber", "Subscriber")
+const ytFetchPage = async (url) => {
+  const res = await fetch(url, {
+    headers: {
+      'Accept-Language': 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      Cookie: 'SOCS=CAI; CONSENT=YES+1'
+    },
+    signal: AbortSignal.timeout(10000)
+  });
+  return { status: res.status, url: res.url || url, html: await res.text() };
+};
+const ytFetchHtml = async (url) => (await ytFetchPage(url)).html;
 
-    raw = []
-    for attr in ("badge_list", "badges"):          # badge_list first; badges is a legacy alias
-        value = _safe(user, attr)
-        if value:
-            try:
-                raw = list(value)
-                break
-            except Exception:
-                pass
+async function channelIdFromHandle(yt, handle) {
+  try {
+    const ep = await yt.resolveURL(`https://www.youtube.com/@${handle}`);
+    const id = ep?.payload?.browseId;
+    if (id) return id;
+  } catch {}
+  try {
+    const html = await ytFetchHtml(`https://www.youtube.com/@${handle}`);
+    const m = html.match(/"(?:channelId|externalId|browseId)":"(UC[\w-]{22})"/);
+    if (m) return m[1];
+  } catch {}
+  return null;
+}
 
-    debug = []
-    image_found = False
-    for b in raw:
-        try:
-            scene, url, uri, text = _extract_badge(b)
-            kind = _classify(scene, uri, text) or re.sub(r"[^a-z0-9_-]", "", scene) or "badge"
-            debug.append(f"{scene or '?'}|{kind}|uri={uri[:40] or '-'}|img={'y' if url else 'n'}|text={text[:20] or '-'}")
-            if not (url or text) and kind == "badge":
-                continue                            # nothing to show
-            image_found = image_found or bool(url)
-            add(kind, text or kind, url, uri)
-        except Exception as e:
-            debug.append(f"error:{type(e).__name__}")
+function pickLiveVideoId(videos) {
+  for (const v of videos || []) {
+    const id = v?.video_id || v?.id || v?.content_id;
+    if (!YT_VIDEO_ID.test(String(id))) continue;
+    const badgeLive = (v?.badges || []).some?.((b) => /LIVE_NOW/i.test(String(b?.style || b?.label || '')));
+    if (v?.is_live === true || badgeLive) return id;
+  }
+  return null;
+}
 
-    # Legacy ImageModel lists: only used when the structured badges gave no image.
-    if not image_found:
-        for attr in ("badge_image_list", "media_badge_image_list"):
-            for img in _safe(user, attr) or []:
-                try:
-                    url, uri = _image_info(img)
-                    if url:
-                        add(_classify(uri) or "badge", "", url, uri)
-                except Exception:
-                    continue
+// <channel>/live redirects to the current stream when there is one.
+async function liveIdFromLivePage(pathPart) {
+  try {
+    const p = await ytFetchPage(`https://www.youtube.com/${pathPart}/live`);
+    const fromUrl = p.url.match(/[?&]v=([\w-]{11})/);
+    const fromCanon = p.html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
+    let id = fromUrl?.[1] || fromCanon?.[1] || null;
+    if (!id) {
+      // Watch-page data embedded in the HTML: videoDetails followed by isLive:true.
+      const i = p.html.indexOf('"videoDetails":{"videoId":"');
+      if (i !== -1) {
+        const chunk = p.html.slice(i, i + 4000);
+        const m = chunk.match(/"videoId":"([\w-]{11})"/);
+        if (m && /"isLive":true/.test(chunk)) id = m[1];
+      }
+    }
+    const wall = /consent\.youtube\.com/.test(p.url) ? ' (CONSENT WALL)' : '';
+    console.log(`[YouTube] /live page ${pathPart}: HTTP ${p.status}, ${p.html.length} bytes, final URL ${p.url.slice(0, 90)}, video ${id || 'none'}${wall}`);
+    return id;
+  } catch (err) {
+    console.error(`[YouTube] /live page ${pathPart} failed:`, err?.message || err);
+    return null;
+  }
+}
 
-    if _badge_debug_left > 0:
-        _badge_debug_left -= 1
-        log(f"badge debug @{handle or '?'}: {len(raw)} raw -> {debug} => {[b['type'] for b in out]}")
-    return out
+// RSS feed lists a channel's newest uploads and streams (no Innertube parsing).
+async function ytFeedVideoIds(channelId) {
+  try {
+    const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(10000)
+    });
+    const xml = await res.text();
+    const ids = [...xml.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)].map((m) => m[1]).slice(0, 6);
+    console.log(`[YouTube] RSS feed ${channelId}: HTTP ${res.status}, ${ids.length} video(s)`);
+    return res.ok ? ids : [];
+  } catch (err) {
+    console.error('[YouTube] RSS feed failed:', err?.message || err);
+    return [];
+  }
+}
 
+const YT_STREAMS_TAB = 'EgdzdHJlYW1z8gYECgJ6AA%3D%3D'; // "streams" tab of a channel
+const YT_API_KEY = process.env.YOUTUBE_API_KEY; // optional, official Data API v3
 
-def gift_in_progress(event):
-    """True while a gift streak is still running (only the final event should be shown).
+// Raw browse of the channel's Streams tab. Regexes the JSON instead of relying
+// on the library's parser classes, which break whenever YouTube changes layout.
+async function ytStreamsTabIds(yt, channelId) {
+  try {
+    const res = await yt.actions.execute('/browse', { browseId: channelId, params: YT_STREAMS_TAB });
+    const json = JSON.stringify(res?.data || res || {});
+    const live = [];
+    const rest = [];
+    const seen = new Set();
+    for (const m of json.matchAll(/"videoId":"([\w-]{11})"/g)) {
+      if (seen.has(m[1])) continue;
+      seen.add(m[1]);
+      const near = json.slice(m.index, m.index + 3000);
+      (/BADGE_STYLE_TYPE_LIVE_NOW|"style":"LIVE"|LIVE_NOW/.test(near) ? live : rest).push(m[1]);
+    }
+    console.log(`[YouTube] Raw streams tab ${channelId}: ${json.length} bytes, ${seen.size} video id(s), ${live.length} flagged live`);
+    return [...live, ...rest].slice(0, 8);
+  } catch (err) {
+    console.error('[YouTube] Raw streams tab failed:', err?.message || err);
+    return [];
+  }
+}
 
-    Newer TikTokLive versions can hand us a gift object without `streakable`,
-    and `event.streaking` reads that same attribute, so neither is trusted.
-    """
-    gift = getattr(event, "gift", None)
-    streakable = getattr(gift, "streakable", None)
-    if streakable is None:
-        gift_type = getattr(gift, "type", None)
-        if gift_type is None:
-            gift_type = getattr(gift, "gift_type", None)
-        if gift_type is None:
-            return False  # unknown: show every event rather than hide gifts
-        streakable = gift_type == 1
-    return bool(streakable) and not bool(getattr(event, "repeat_end", 0))
+// Optional: official API (set env YOUTUBE_API_KEY). 2 quota units per check.
+async function ytApiLiveIds(channelId) {
+  if (!YT_API_KEY || !/^UC/.test(channelId)) return [];
+  const get = async (url) => {
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`YouTube API ${r.status}: ${j?.error?.message || 'error'}`);
+    return j;
+  };
+  try {
+    const pl = await get(`https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=8&playlistId=UU${channelId.slice(2)}&key=${YT_API_KEY}`);
+    const ids = (pl.items || []).map((i) => i.contentDetails?.videoId).filter(Boolean);
+    if (!ids.length) return [];
+    const v = await get(`https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${ids.join(',')}&key=${YT_API_KEY}`);
+    const live = (v.items || []).filter((x) => x.snippet?.liveBroadcastContent === 'live').map((x) => x.id);
+    console.log(`[YouTube] Data API ${channelId}: ${ids.length} recent upload(s), ${live.length} live`);
+    return live;
+  } catch (err) {
+    console.error('[YouTube] Data API failed:', err?.message || err);
+    return [];
+  }
+}
 
+// Collects candidate video IDs from several sources, then keeps the first one
+// that really has an ACTIVE live chat (ended streams only have a replay chat).
+async function findLiveVideoId(yt, t) {
+  const candidates = [];
+  const add = (id, src) => { if (id && YT_VIDEO_ID.test(id) && !candidates.some((c) => c.id === id)) candidates.push({ id, src }); };
 
-def build_client():
-    client = TikTokLiveClient(unique_id=username)
+  let channelId = t.type === 'handle' ? await channelIdFromHandle(yt, t.value) : t.value;
+  console.log(`[YouTube] ${t.label}: channel id ${channelId || 'NOT RESOLVED'}`);
 
-    @client.on(ConnectEvent)
-    async def on_connect(event: ConnectEvent):
-        status("connected")
+  // 1. The channel's /live page redirects to the current stream.
+  add(await liveIdFromLivePage(t.type === 'handle' ? `@${t.value}` : `channel/${t.value}`), '/live page');
 
-    @client.on(DisconnectEvent)
-    async def on_disconnect(event: DisconnectEvent):
-        status("disconnected")
+  if (!channelId && !candidates.length) throw codeErr('NOT_FOUND', `YouTube channel ${t.label} not found`);
 
-    @client.on(CommentEvent)
-    async def on_comment(event: CommentEvent):
-        text = event.comment
-        if not text:
-            return
-        emit({
-            "type": "message",
-            "platform": "tiktok",
-            "username": display_name(event.user),
-            "handle": getattr(event.user, "unique_id", ""),
-            "message": text,
-            "avatar": avatar_of(event.user),
-            "badges": badges_of(event.user),
-            "id": message_id(event),
-            "timestamp": int(time.time() * 1000),
-        })
+  if (channelId) {
+    for (const id of await ytApiLiveIds(channelId)) add(id, 'Data API');
+    for (const id of await ytStreamsTabIds(yt, channelId)) add(id, 'raw streams tab');
+    // 2. Innertube channel tabs.
+    try {
+      const channel = await yt.getChannel(channelId);
+      if (channel.has_live_streams) {
+        const vids = (await channel.getLiveStreams()).videos || [];
+        console.log(`[YouTube] Innertube live tab: ${vids.length} item(s)`);
+        add(pickLiveVideoId(vids), 'Innertube streams tab (live badge)');
+        vids.slice(0, 5).forEach((v) => add(v?.video_id || v?.id || v?.content_id, 'Innertube streams tab'));
+      }
+      add(pickLiveVideoId(channel.videos), 'Innertube home');
+      console.log(`[YouTube] Innertube channel ${channelId}: live tab ${channel.has_live_streams ? 'yes' : 'no'}, home items ${(channel.videos || []).length}`);
+    } catch (err) {
+      console.error('[YouTube] Channel lookup failed:', err?.message || err);
+    }
+    // 3. RSS feed: newest uploads/streams.
+    for (const id of await ytFeedVideoIds(channelId)) add(id, 'RSS feed');
+  }
 
-    @client.on(GiftEvent)
-    async def on_gift(event: GiftEvent):
-        try:
-            if gift_in_progress(event):
-                return
-            gift = getattr(event, "gift", None)
-            name = getattr(gift, "name", "") or "a gift"
-            count = getattr(event, "repeat_count", 1) or 1
-            emit({
-                "type": "message",
-                "platform": "tiktok",
-                "username": display_name(event.user),
-                "handle": getattr(event.user, "unique_id", ""),
-                "message": f"sent {count}x {name} \U0001F381",
-                "avatar": avatar_of(event.user),
-                "badges": badges_of(event.user),
-                "id": message_id(event),
-                "timestamp": int(time.time() * 1000),
-            })
-        except Exception as e:
-            log(f"Gift event skipped: {type(e).__name__}: {e}")
+  console.log(`[YouTube] ${t.label}: ${candidates.length} candidate(s): ${candidates.map((c) => `${c.id} (${c.src})`).join(', ') || 'none'}`);
 
-    return client
+  let lastErr = null;
+  for (const c of candidates) {
+    try {
+      if (await ytChatStart(yt, c.id)) {
+        console.log(`[YouTube] ${t.label}: live chat found on ${c.id} via ${c.src}`);
+        return c.id;
+      }
+    } catch (e) {
+      lastErr = e;
+      console.error(`[YouTube] Chat check failed for ${c.id}:`, e?.message || e);
+    }
+  }
+  if (lastErr) throw lastErr; // show the real error (e.g. 403) instead of "not live"
+  throw codeErr('NOT_LIVE', `${t.label} is not live right now`);
+}
 
+// --- Chat parsing (raw InnerTube JSON; avoids the /player endpoint, which
+// YouTube blocks with 403 for many server IPs) -------------------------------
+const ytText = (t) => {
+  if (!t) return '';
+  if (t.simpleText) return t.simpleText;
+  return (t.runs || []).map((r) => r.text ?? r.emoji?.shortcuts?.[0] ?? r.emoji?.emojiId ?? '').join('');
+};
 
-async def main():
-    delay = ERROR_RETRY_MIN_S
-    while True:
-        client = build_client()
-        try:
-            status("connecting")
-            # start() is NON-blocking: it returns the connection task as soon as
-            # the socket is up. Await the task so the process stays alive.
-            task = await client.start()
-            delay = ERROR_RETRY_MIN_S
-            await task
-            log("Connection ended, reconnecting in 5s")
-            await asyncio.sleep(5)
-        except Exception as e:
-            name = type(e).__name__
-            if name == "UserNotFoundError":
-                emit({"type": "error", "message": f"TikTok user @{username} not found", "fatal": True})
-                return
-            if name == "UserOfflineError":
-                log(f"@{username} is not live. Checking again in {OFFLINE_RETRY_S}s")
-                status("connecting")
-                await asyncio.sleep(OFFLINE_RETRY_S)
-                continue
-            hint = ""
-            if name in ("WebcastBlockedError", "WebcastBlocked200Error", "SignAPIError",
-                        "SignatureRateLimitError", "UnexpectedSignatureError", "SignatureMissingTokensError"):
-                hint = " (TikTok or the signing service is blocking this server; datacenter IPs such as Render are often blocked)"
-            emit({"type": "error", "message": f"{name}: {e}{hint}"})
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, ERROR_RETRY_MAX_S)
-        finally:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+function ytBadges(r) {
+  return (r.authorBadges || [])
+    .map((b) => b?.liveChatAuthorBadgeRenderer)
+    .filter(Boolean)
+    .map((b) => {
+      const icon = String(b.icon?.iconType || '').toLowerCase(); // owner | moderator | verified
+      const url = b.customThumbnail?.thumbnails?.slice(-1)[0]?.url || ''; // channel member badge image
+      return { type: icon || (url ? 'member' : 'badge'), label: b.tooltip || icon || 'Member', url };
+    });
+}
 
+function ytItemToMessage(item, isSeen) {
+  const paid = Boolean(item?.liveChatPaidMessageRenderer);
+  const r = item?.liveChatTextMessageRenderer || item?.liveChatPaidMessageRenderer;
+  if (!r) return null;
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+  const id = r.id ? `youtube-${r.id}` : null;
+  if (id && isSeen(id)) return null;
+
+  let text = ytText(r.message);
+  if (paid) text = `\u{1F4B0} ${ytText(r.purchaseAmountText)} ${text}`.trim();
+  if (!text) return null;
+
+  return normalizeMessage('youtube', ytText(r.authorName) || 'Viewer', text, r.authorPhoto?.thumbnails?.[0]?.url || '', id, ytBadges(r));
+}
+
+function ytNextContinuation(conts) {
+  const c = conts?.[0];
+  const d = c?.invalidationContinuationData || c?.timedContinuationData || c?.reloadContinuationData;
+  return d?.continuation ? { token: d.continuation, wait: d.timeoutMs } : null;
+}
+
+const YT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+// Primary method: the public chat popout page (same one used by the chat
+// popout in the browser). It does not use /next or /player, which YouTube
+// blocks with 403 for many server IPs. Returns null if there is no ACTIVE chat.
+async function ytPopoutStart(videoId) {
+  const p = await ytFetchPage(`https://www.youtube.com/live_chat?is_popout=1&v=${videoId}`);
+  if (p.status !== 200) throw new Error(`live_chat page HTTP ${p.status}`);
+  const m = p.html.match(/(?:window\["ytInitialData"\]|var ytInitialData)\s*=\s*(\{.+?\});\s*<\/script>/s);
+  if (!m) throw new Error('live_chat page had no chat data (consent or blocked page?)');
+  let data;
+  try { data = JSON.parse(m[1]); } catch { throw new Error('live_chat data unreadable'); }
+  const lc = data?.contents?.liveChatRenderer;
+  if (!lc || lc.isReplay) return null;
+  const next = ytNextContinuation(lc.continuations);
+  if (!next) return null;
+  const apiKey = p.html.match(/"INNERTUBE_API_KEY":"([\w-]+)"/)?.[1];
+  const clientVersion =
+    p.html.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION":"([\d.]+)"/)?.[1] || p.html.match(/"clientVersion":"([\d.]+)"/)?.[1];
+  if (!apiKey || !clientVersion) throw new Error('live_chat page missing API key or client version');
+  return { mode: 'popout', next, apiKey, clientVersion };
+}
+
+// Fallback: Innertube /next (blocked with 403 on some hosts).
+async function ytNextStart(yt, videoId) {
+  const res = await yt.actions.execute('/next', { videoId });
+  const data = res?.data || res;
+  const lc = data?.contents?.twoColumnWatchNextResults?.conversationBar?.liveChatRenderer;
+  if (!lc || lc.isReplay) return null;
+  const next = ytNextContinuation(lc.continuations);
+  return next ? { mode: 'innertube', next } : null;
+}
+
+// Returns { mode, next, ... } for an active chat, or null if none.
+async function ytChatStart(yt, videoId) {
+  let popErr = null;
+  try {
+    return await ytPopoutStart(videoId);
+  } catch (e) {
+    popErr = e;
+    console.error(`[YouTube] Popout chat page failed for ${videoId}:`, e?.message || e);
+  }
+  try {
+    return await ytNextStart(yt, videoId);
+  } catch (e) {
+    throw new Error(`${popErr.message} | fallback: ${e?.message || e}`);
+  }
+}
+
+async function ytChatPoll(yt, chat) {
+  if (chat.mode === 'popout') {
+    const r = await fetch(`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${chat.apiKey}&prettyPrint=false`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': YT_UA,
+        Origin: 'https://www.youtube.com',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Cookie: 'SOCS=CAI; CONSENT=YES+1'
+      },
+      body: JSON.stringify({
+        context: { client: { clientName: 'WEB', clientVersion: chat.clientVersion, hl: 'en', gl: 'US' } },
+        continuation: chat.next.token
+      }),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!r.ok) throw new Error(`get_live_chat HTTP ${r.status}`);
+    return r.json();
+  }
+  const res = await yt.actions.execute('/live_chat/get_live_chat', { continuation: chat.next.token });
+  return res?.data || res;
+}
+
+async function connectYouTube(input) {
+  disconnectPlatform('youtube');
+  const targets = youTubeTargets(input);
+  if (!targets.length) {
+    return updatePlatformStatus('youtube', 'error', String(input), 'Use a @handle, channel URL, or video URL/ID');
+  }
+  const token = Symbol('yt');
+  activeAdapters.youtube.token = token;
+  console.log(`[YouTube] Connecting: ${targets.map((t) => `${t.type}:${t.value}`).join(', ')}`);
+  updatePlatformStatus('youtube', 'connecting', targets[0].label);
+  runYouTube(targets, token, targets[0].label);
+}
+
+async function runYouTube(targets, token, label) {
+  const adapter = () => activeAdapters.youtube;
+  const current = () => adapter().token === token;
+  const watching = targets.some((t) => t.type !== 'video');
+
+  const fail = (msg) => {
+    console.error(`[YouTube] ${msg}`);
+    if (current()) updatePlatformStatus('youtube', 'error', label, msg);
+  };
+  const retryLater = (why) => {
+    if (!current()) return;
+    console.log(`[YouTube] ${why}. Checking again in ${YT_RETRY_MS / 1000}s`);
+    updatePlatformStatus('youtube', 'connecting', `${label} (${String(why).slice(0, 80)})`);
+    clearTimeout(adapter().retry);
+    adapter().retry = setTimeout(() => runYouTube(targets, token, label), YT_RETRY_MS);
+  };
+
+  try {
+    const yt = await getInnertube();
+    if (!current()) return;
+
+    // 1. Find a live video ID.
+    let videoId = null;
+    let notLive = false;
+    let lastErr = null;
+    for (const t of targets) {
+      try {
+        videoId = t.type === 'video' ? t.value : await findLiveVideoId(yt, t);
+        if (videoId) break;
+      } catch (e) {
+        lastErr = e;
+        if (e.code === 'NOT_LIVE') notLive = true;
+      }
+    }
+    if (!current()) return;
+    if (!videoId) {
+      if (notLive || watching) return retryLater(lastErr?.message || 'Not live');
+      return fail(lastErr?.message || 'YouTube video not found');
+    }
+
+    // 2. Get the chat continuation (skips the blocked /player endpoint).
+    const chat = await ytChatStart(yt, videoId);
+    if (!current()) return;
+    if (!chat) {
+      return watching ? retryLater('No live chat yet') : fail('That video has no live chat right now');
+    }
+
+    // 3. Poll the chat.
+    const isSeen = makeSeen(1000);
+    let stopped = false;
+    let firstPoll = true; // remember the backlog, do not replay it
+    let failures = 0;
+    let timer = null;
+
+    const finish = (why, err) => {
+      if (stopped) return;
+      stopped = true;
+      clearTimeout(timer);
+      if (!current()) return;
+      adapter().instance = null;
+      if (watching) {
+        ytClientPromise = null;
+        return retryLater(why);
+      }
+      if (err) return fail(String(err?.message || err));
+      updatePlatformStatus('youtube', 'disconnected');
+    };
+
+    const poll = async () => {
+      if (stopped || !current()) return;
+      let delay = 2000;
+      try {
+        const data = await ytChatPoll(yt, chat);
+        const lcc = data?.continuationContents?.liveChatContinuation;
+        if (!lcc) return finish('Stream ended');
+
+        failures = 0;
+        for (const a of lcc.actions || []) {
+          const msg = ytItemToMessage(a?.addChatItemAction?.item, isSeen);
+          if (msg && !firstPoll) broadcastMessage(msg);
+        }
+        firstPoll = false;
+
+        const n = ytNextContinuation(lcc.continuations);
+        if (!n) return finish('Stream ended');
+        chat.next = n;
+        delay = Math.min(Math.max(Number(n.wait) || 2000, 1000), 8000);
+      } catch (err) {
+        failures += 1;
+        console.error(`[YouTube] Chat poll failed (${failures}):`, err?.message || err);
+        if (failures >= 5) return finish('Chat error', err);
+        delay = Math.min(2000 * failures, 10000);
+      }
+      if (!stopped && current()) timer = setTimeout(poll, delay);
+    };
+
+    adapter().instance = { stop: () => { stopped = true; clearTimeout(timer); } };
+    console.log(`[YouTube] Connected to live chat of video ${videoId} (${chat.mode})`);
+    updatePlatformStatus('youtube', 'connected', label);
+    poll();
+  } catch (err) {
+    const msg = String(err?.message || err);
+    console.error('[YouTube] Connect failed:', msg);
+    ytClientPromise = null;
+    if (watching) return retryLater(msg);
+    fail(msg);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. TikTok (Python bridge)
+// ---------------------------------------------------------------------------
+function connectTikTok(username) {
+  disconnectPlatform('tiktok');
+  const user = String(username || '').replace(/^@/, '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._]{0,39}$/.test(user)) {
+    return updatePlatformStatus('tiktok', 'error', String(username), 'Invalid TikTok username');
+  }
+  startBridge('tiktok', 'tiktok_bridge.py', user);
+}
+
+// ---------------------------------------------------------------------------
+// 3. Twitch
+//
+// Badge images: the old https://badges.twitch.tv endpoint was permanently shut
+// down (June 2023). Badge images now come from Helix (Get Global / Channel Chat
+// Badges), which needs an app access token:
+//     env TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET   (dev.twitch.tv/console)
+// Without those, the community IVR API (api.ivr.fi) is used as a fallback.
+// ---------------------------------------------------------------------------
+const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
+const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
+const TWITCH_BADGE_TTL_MS = 60 * 60 * 1000; // good result: keep 1 h
+const TWITCH_BADGE_FAIL_MS = 60 * 1000;     // failure: retry after 1 min
+const twitchBadgeCache = new Map();         // key -> { at, ttl, p }
+let twitchTok = { value: null, exp: 0 };
+
+async function twitchAppToken() {
+  if (twitchTok.value && Date.now() < twitchTok.exp - 60000) return twitchTok.value;
+  const res = await fetch('https://id.twitch.tv/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: TWITCH_CLIENT_ID,
+      client_secret: TWITCH_CLIENT_SECRET,
+      grant_type: 'client_credentials'
+    }),
+    signal: AbortSignal.timeout(8000)
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.access_token) throw new Error(`Twitch auth failed (${res.status}): ${j.message || 'error'}`);
+  twitchTok = { value: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
+  return twitchTok.value;
+}
+
+// Helix ({set_id, versions}) and IVR ({setID, versions}) -> { set: { versions: { id: {...} } } }
+function normBadgeSets(list) {
+  const out = {};
+  for (const s of Array.isArray(list) ? list : []) {
+    const id = s?.set_id || s?.setID;
+    if (!id) continue;
+    const versions = {};
+    for (const v of s.versions || []) {
+      versions[String(v.id ?? v.version)] = {
+        title: v.title,
+        image_url_1x: v.image_url_1x,
+        image_url_2x: v.image_url_2x
+      };
+    }
+    out[id] = { versions };
+  }
+  return out;
+}
+
+async function twitchJson(url, headers) {
+  const r = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+async function loadTwitchBadges(scope, roomId, login) {
+  if (TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET) {
+    try {
+      const token = await twitchAppToken();
+      const url = scope === 'global'
+        ? 'https://api.twitch.tv/helix/chat/badges/global'
+        : `https://api.twitch.tv/helix/chat/badges?broadcaster_id=${encodeURIComponent(roomId)}`;
+      const j = await twitchJson(url, { Authorization: `Bearer ${token}`, 'Client-Id': TWITCH_CLIENT_ID });
+      return normBadgeSets(j.data);
+    } catch (err) {
+      console.error(`[Twitch] Helix ${scope} badges failed:`, err?.message || err);
+      twitchTok = { value: null, exp: 0 };
+    }
+  }
+  // Fallback without credentials (third-party, community run).
+  try {
+    const url = scope === 'global'
+      ? 'https://api.ivr.fi/v2/twitch/badges/global'
+      : `https://api.ivr.fi/v2/twitch/badges/channel?login=${encodeURIComponent(login)}`;
+    return normBadgeSets(await twitchJson(url, { Accept: 'application/json' }));
+  } catch (err) {
+    console.error(`[Twitch] IVR ${scope} badges failed:`, err?.message || err);
+    return null;
+  }
+}
+
+function twitchBadgeSets(scope, roomId = '', login = '') {
+  const key = scope === 'global' ? 'global' : `channel:${roomId}`;
+  const hit = twitchBadgeCache.get(key);
+  if (hit && Date.now() - hit.at < hit.ttl) return hit.p;
+  const entry = { at: Date.now(), ttl: TWITCH_BADGE_TTL_MS, p: null };
+  entry.p = loadTwitchBadges(scope, roomId, login).then((v) => {
+    if (!v) { entry.ttl = TWITCH_BADGE_FAIL_MS; return {}; }
+    console.log(`[Twitch] Loaded ${scope} badge sets: ${Object.keys(v).length}`);
+    return v;
+  });
+  twitchBadgeCache.set(key, entry);
+  return entry.p;
+}
+
+// tags.badges looks like { moderator: '1', subscriber: '12' }.
+// Channel sets override global ones (custom sub / bits badges).
+async function twitchBadges(tags, login = '') {
+  const raw = tags.badges;
+  if (!raw || typeof raw !== 'object') return [];
+  const room = tags['room-id'];
+  const [glob, chan] = await Promise.all([
+    twitchBadgeSets('global'),
+    room ? twitchBadgeSets('channel', room, login) : {}
+  ]);
+  return Object.entries(raw).map(([name, version]) => {
+    const v = chan[name]?.versions?.[version] || glob[name]?.versions?.[version];
+    return { type: name, label: v?.title || name, url: v?.image_url_2x || v?.image_url_1x || '' };
+  });
+}
+
+async function connectTwitch(channel) {
+  disconnectPlatform('twitch');
+  const chan = String(channel || '').replace(/^#/, '').trim().toLowerCase();
+  if (!/^[a-z0-9_]{3,25}$/.test(chan)) {
+    return updatePlatformStatus('twitch', 'error', String(channel), 'Invalid Twitch channel');
+  }
+
+  updatePlatformStatus('twitch', 'connecting', chan);
+  const client = new tmi.Client({ channels: [chan] });
+  activeAdapters.twitch.client = client;
+  const isCurrent = () => activeAdapters.twitch.client === client;
+
+  client.on('message', async (_c, tags, message, self) => {
+    if (self || !isCurrent()) return;
+    let badges = [];
+    try { badges = await twitchBadges(tags, chan); } catch {}
+    if (!isCurrent()) return;
+    broadcastMessage(normalizeMessage('twitch', tags['display-name'] || tags.username, message, '', tags.id ? `twitch-${tags.id}` : null, badges));
+  });
+  client.on('disconnected', () => {
+    if (isCurrent() && activeAdapters.twitch.status !== 'error') updatePlatformStatus('twitch', 'disconnected');
+  });
+  client.on('connected', () => {
+    if (isCurrent()) updatePlatformStatus('twitch', 'connected', chan);
+  });
+
+  try {
+    await client.connect();
+  } catch (err) {
+    if (isCurrent()) updatePlatformStatus('twitch', 'error', chan, String(err?.message || err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Kick: official API + webhooks.
+// Setup: https://kick.com/settings/developer -> create an app, then set
+//   env KICK_CLIENT_ID, KICK_CLIENT_SECRET
+//   Webhook URL in the Kick app settings: https://YOUR-HOST/webhooks/kick
+// Kick badges come as { type, text, count? } with no image URL, so the overlay
+// has to draw them by `type` (moderator, subscriber, sub_gifter, vip, og, ...).
+// ---------------------------------------------------------------------------
+const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID;
+const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET;
+const KICK_API = 'https://api.kick.com/public/v1';
+let kickToken = { value: null, exp: 0 };
+let kickPublicKeyPem = null;
+const kickSeen = makeSeen(1000);
+
+async function kickAppToken(force = false) {
+  if (!force && kickToken.value && Date.now() < kickToken.exp - 60000) return kickToken.value;
+  const res = await fetch('https://id.kick.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: KICK_CLIENT_ID,
+      client_secret: KICK_CLIENT_SECRET
+    }),
+    signal: AbortSignal.timeout(10000)
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.access_token) {
+    throw new Error(`Kick auth failed (${res.status}): ${j.error_description || j.error || j.message || 'unknown error'}`);
+  }
+  kickToken = { value: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
+  return kickToken.value;
+}
+
+async function kickApi(method, pathAndQuery, body, retried = false) {
+  const token = await kickAppToken(retried);
+  const res = await fetch(KICK_API + pathAndQuery, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {})
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(10000)
+  });
+  if (res.status === 401 && !retried) return kickApi(method, pathAndQuery, body, true);
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Kick API ${method} ${pathAndQuery.split('?')[0]} -> ${res.status}: ${j.message || j.error || 'error'}`);
+  return j;
+}
+
+// Kick's webhook sends badges as { type, text, count? } without images, and
+// Kick's own role badges are bundled inside its website (no public URL). So:
+//  - role badges use the icons in public/icons/kick/ (served by this server)
+//  - the channel's custom subscriber badges are fetched best-effort from Kick's
+//    unofficial website API (may be blocked; falls back to the local icon)
+const KICK_ICON_FILES = new Set(['broadcaster', 'moderator', 'vip', 'og', 'founder', 'subscriber', 'staff', 'verified', 'subgifter', 'sidekick']);
+
+function kickBadgeIcon(type, count) {
+  const key = String(type || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const k = key === 'owner' ? 'broadcaster' : key === 'mod' ? 'moderator' : key;
+  if (k === 'subgifter') {
+    const tier = [200, 100, 50, 25].find((t) => Number(count) >= t);
+    return `/icons/kick/subgifter${tier || ''}.svg`;
+  }
+  return KICK_ICON_FILES.has(k) ? `/icons/kick/${k}.svg` : '/icons/kick/unknown.svg';
+}
+
+async function kickChannelSubBadges(slug) {
+  try {
+    const r = await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
+      headers: { Accept: 'application/json', 'User-Agent': YT_UA },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const list = (j.subscriber_badges || [])
+      .map((b) => ({ months: Number(b.months) || 0, url: b.badge_image?.src || '' }))
+      .filter((b) => /^https:\/\//i.test(b.url))
+      .sort((a, b) => a.months - b.months);
+    console.log(`[Kick] ${slug}: ${list.length} custom subscriber badge(s)`);
+    return list;
+  } catch (err) {
+    console.log(`[Kick] Custom sub badges unavailable for ${slug} (${err?.message || err}); using default icons`);
+    return [];
+  }
+}
+
+function kickSubBadgeUrl(list, months) {
+  if (!list?.length) return '';
+  const m = Number(months) || 0;
+  let pick = list[0];
+  for (const b of list) if (b.months <= m) pick = b;
+  return pick.url;
+}
+
+async function connectKick(slug) {
+  disconnectPlatform('kick');
+  const clean = String(slug || '').toLowerCase().trim().replace(/^@/, '');
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(clean)) {
+    return updatePlatformStatus('kick', 'error', String(slug), 'Invalid Kick channel name');
+  }
+  if (!KICK_CLIENT_ID || !KICK_CLIENT_SECRET) {
+    return updatePlatformStatus('kick', 'error', clean, 'Set KICK_CLIENT_ID and KICK_CLIENT_SECRET in the server environment');
+  }
+
+  const token = Symbol('kick');
+  activeAdapters.kick.token = token;
+  updatePlatformStatus('kick', 'connecting', clean);
+
+  try {
+    const ch = await kickApi('GET', `/channels?slug=${encodeURIComponent(clean)}`);
+    const broadcasterId = Number(ch?.data?.[0]?.broadcaster_user_id);
+    if (!broadcasterId) throw new Error(`Kick channel "${clean}" not found`);
+    console.log(`[Kick] Channel ${clean} -> broadcaster_user_id ${broadcasterId}`);
+
+    const subs = await kickApi('GET', '/events/subscriptions');
+    const exists = (subs.data || []).some(
+      (s) => s.event === 'chat.message.sent' && Number(s.broadcaster_user_id) === broadcasterId
+    );
+    if (!exists) {
+      const r = await kickApi('POST', '/events/subscriptions', {
+        broadcaster_user_id: broadcasterId,
+        events: [{ name: 'chat.message.sent', version: 1 }],
+        method: 'webhook'
+      });
+      const bad = (r.data || []).find((d) => d.error);
+      if (bad) throw new Error(`Subscription refused: ${bad.error}`);
+      console.log('[Kick] Subscribed to chat.message.sent');
+    } else {
+      console.log('[Kick] Already subscribed to chat.message.sent');
+    }
+
+    if (activeAdapters.kick.token !== token) return; // cancelled meanwhile
+    const subBadges = await kickChannelSubBadges(clean);
+    if (activeAdapters.kick.token !== token) return;
+    activeAdapters.kick.instance = { broadcasterId, slug: clean, subBadges };
+    updatePlatformStatus('kick', 'connected', clean);
+  } catch (err) {
+    console.error('[Kick] Connect failed:', err?.message || err);
+    if (activeAdapters.kick.token === token) updatePlatformStatus('kick', 'error', clean, String(err?.message || err));
+  }
+}
+
+async function getKickPublicKey(refresh = false) {
+  if (kickPublicKeyPem && !refresh) return kickPublicKeyPem;
+  const j = await kickApi('GET', '/public-key');
+  kickPublicKeyPem = j?.data?.public_key;
+  if (!kickPublicKeyPem) throw new Error('Kick public key missing in response');
+  return kickPublicKeyPem;
+}
+
+function kickSignatureValid(headers, rawBody, pem) {
+  const id = headers['kick-event-message-id'];
+  const ts = headers['kick-event-message-timestamp'];
+  const sig = headers['kick-event-signature'];
+  if (!id || !ts || !sig) return false;
+  const key = crypto.createPublicKey(pem);
+  const data = Buffer.from(`${id}.${ts}.${rawBody.toString('utf8')}`);
+  const algo = key.asymmetricKeyType === 'ed25519' ? null : 'RSA-SHA256'; // RSA or Ed25519
+  return crypto.verify(algo, data, key, Buffer.from(sig, 'base64'));
+}
+
+async function handleKickWebhook(req, res) {
+  try {
+    const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+    let ok = false;
+    try {
+      ok = kickSignatureValid(req.headers, raw, await getKickPublicKey());
+      if (!ok) ok = kickSignatureValid(req.headers, raw, await getKickPublicKey(true)); // key rotation
+    } catch (err) {
+      console.error('[Kick Webhook] Signature check error:', err?.message || err);
+    }
+    if (!ok) {
+      console.warn('[Kick Webhook] Rejected: bad signature');
+      return res.status(401).end();
+    }
+
+    res.status(200).end(); // answer fast: Kick unsubscribes after failed deliveries
+
+    if (req.headers['kick-event-type'] !== 'chat.message.sent') return;
+    if (kickSeen(req.headers['kick-event-message-id'])) return;
+
+    const p = JSON.parse(raw.toString('utf8'));
+    const active = activeAdapters.kick.instance;
+    if (!active || Number(p.broadcaster?.user_id) !== active.broadcasterId) return;
+
+    const kickBadges = (p.sender?.identity?.badges || []).map((b) => {
+      const count = Number.isFinite(b.count) && b.count > 0 ? b.count : 0;
+      const isSub = String(b.type).toLowerCase() === 'subscriber';
+      return {
+        type: b.type,
+        label: `${b.text || b.type}${count ? ` ${count}` : ''}`,
+        url: (isSub && kickSubBadgeUrl(active.subBadges, count)) || kickBadgeIcon(b.type, count)
+      };
+    });
+
+    broadcastMessage(
+      normalizeMessage('kick', p.sender?.username, p.content, p.sender?.profile_picture || '', p.message_id ? `kick-${p.message_id}` : null, kickBadges)
+    );
+  } catch (err) {
+    console.error('[Kick Webhook] Error:', err);
+    if (!res.headersSent) res.status(200).end();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Rumble: official Live Stream API (polled). Works for YOUR OWN channel
+// only and only while you are live. Get the URL at
+// rumble.com/account/livestream-api (it contains your secret key). Paste the
+// full URL (or just the key) into the dashboard, or put it in env
+// RUMBLE_API_URL and type "env" as the handle. The URL/key is never stored in
+// the status `handle`, so it is not broadcast to overlay viewers.
+// ---------------------------------------------------------------------------
+const RUMBLE_POLL_MS = 4000;
+
+function resolveRumbleUrl(input) {
+  let v = String(input || '').trim();
+  if (v.toLowerCase() === 'env') v = process.env.RUMBLE_API_URL || process.env.RUMBLE_API_KEY || '';
+  if (!v) return null;
+  try {
+    let u;
+    if (/^https?:\/\//i.test(v)) {
+      u = new URL(v);
+    } else if (/^[\w-]{8,}$/.test(v)) {
+      u = new URL('https://rumble.com/-livestream-api/get-data');
+      u.searchParams.set('key', v);
+    } else {
+      return null;
+    }
+    const hostOk = u.hostname === 'rumble.com' || u.hostname.endsWith('.rumble.com');
+    return u.protocol === 'https:' && hostOk ? u : null; // blocks requests to other hosts
+  } catch {
+    return null;
+  }
+}
+
+async function connectRumble(input) {
+  disconnectPlatform('rumble');
+  const url = resolveRumbleUrl(input);
+  if (!url) {
+    return updatePlatformStatus('rumble', 'error', '', 'Paste your Rumble Live Stream API URL (rumble.com/account/livestream-api) or key');
+  }
+
+  const token = Symbol('rumble');
+  activeAdapters.rumble.token = token;
+  updatePlatformStatus('rumble', 'connecting', 'Rumble');
+
+  const isSeen = makeSeen(2000);
+  let firstPoll = true;
+  let failures = 0;
+  let wasLive = null;
+  const current = () => activeAdapters.rumble.token === token;
+
+  const poll = async () => {
+    if (!current()) return;
+    let delay = RUMBLE_POLL_MS;
+    try {
+      const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+      if ([401, 403, 404].includes(res.status)) {
+        // Wrong or revoked key: retrying will not help.
+        return updatePlatformStatus('rumble', 'error', '', `Rumble rejected the API key (HTTP ${res.status}). Reset it at rumble.com/account/livestream-api`);
+      }
+      if (!res.ok) throw new Error(`Rumble API returned HTTP ${res.status}`);
+      const data = await res.json();
+      if (!current()) return;
+
+      failures = 0;
+      if (activeAdapters.rumble.status !== 'connected') {
+        updatePlatformStatus('rumble', 'connected', data.username || 'Rumble');
+      }
+
+      const streams = Array.isArray(data.livestreams) ? data.livestreams : [];
+      const stream = streams.find((s) => s?.is_live) || streams[0];
+      const live = Boolean(stream?.is_live);
+      if (live !== wasLive) {
+        console.log(`[Rumble] ${live ? 'Stream is live' : 'No live stream right now (chat only appears while live)'}`);
+        wasLive = live;
+      }
+
+      const chat = stream?.chat || {};
+      const items = [
+        ...(chat.recent_messages || []).map((m) => ({ ...m, _rant: false })),
+        ...(chat.recent_rants || []).map((m) => ({ ...m, _rant: true }))
+      ].sort((a, b) => String(a.created_on || '').localeCompare(String(b.created_on || '')));
+
+      for (const m of items) {
+        const id = `rumble-${m._rant ? 'rant-' : ''}${m.id ?? `${m.username}-${m.created_on}-${m.text}`}`;
+        if (isSeen(id)) continue;
+        if (firstPoll) continue; // existing backlog: remember it, do not replay it
+        if (!m.text && !m._rant) continue;
+
+        let text = m.text || '';
+        if (m._rant) {
+          const dollars = m.amount_dollars ?? (m.amount_cents != null ? m.amount_cents / 100 : null);
+          text = `\u{1F4B0} Rant${dollars != null ? ` $${Number(dollars).toFixed(2)}` : ''}${text ? `: ${text}` : ''}`;
+        }
+        broadcastMessage(normalizeMessage('rumble', m.username, text, '', id, m.badges));
+      }
+      firstPoll = false;
+    } catch (err) {
+      failures += 1;
+      console.error(`[Rumble] Poll failed (${failures}):`, err?.message || err);
+      delay = Math.min(RUMBLE_POLL_MS * 2 ** Math.min(failures, 3), 30000);
+      if (failures === 3 && current()) updatePlatformStatus('rumble', 'error', '', `Rumble API unreachable: ${err?.message || err}`);
+    }
+    if (current()) activeAdapters.rumble.timer = setTimeout(poll, delay);
+  };
+
+  poll();
+}
+
+// ---------------------------------------------------------------------------
+// 6. Facebook: not implemented. Reports that honestly instead of faking it.
+// ---------------------------------------------------------------------------
+function connectUnsupported(platform, handle) {
+  disconnectPlatform(platform);
+  updatePlatformStatus(platform, 'error', String(handle || ''), `${platform} chat is not implemented yet`);
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect
+// ---------------------------------------------------------------------------
+function disconnectPlatform(platform, { silent = false } = {}) {
+  const a = activeAdapters[platform];
+  if (!a) return;
+
+  clearTimeout(a.retry);
+  clearTimeout(a.timer);
+  try { a.instance?.stop?.(); } catch {}
+  try { a.process?.kill('SIGTERM'); } catch {}
+  try { a.client?.disconnect?.()?.catch?.(() => {}); } catch {}
+
+  activeAdapters[platform] = blankAdapter();
+  if (!silent) updatePlatformStatus(platform, 'disconnected');
+}
+
+// ---------------------------------------------------------------------------
+// API
+// ---------------------------------------------------------------------------
+function requireAuth(req, res, next) {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  if (authBlocked(ip)) return res.status(429).json({ error: 'Too many failed attempts. Try again later.' });
+  const given = req.body?.auth;
+  if (typeof given !== 'string' || !passOk(given)) {
+    authFailed(ip);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+const connectors = {
+  youtube: connectYouTube,
+  tiktok: connectTikTok,
+  twitch: connectTwitch,
+  kick: connectKick,
+  facebook: (h) => connectUnsupported('facebook', h),
+  rumble: connectRumble
+};
+
+app.post('/api/connect', requireAuth, (req, res) => {
+  const { platform, handle } = req.body;
+  const connect = Object.prototype.hasOwnProperty.call(connectors, platform) ? connectors[platform] : null;
+  if (!connect) return res.status(400).json({ error: 'Unsupported platform' });
+  if (typeof handle !== 'string' || !handle.trim() || handle.length > 200) {
+    return res.status(400).json({ error: 'Missing or invalid handle' });
+  }
+  Promise.resolve(connect(handle.trim())).catch((err) => console.error(`[${platform}] connect crashed:`, err));
+  res.json({ success: true });
+});
+
+app.post('/api/disconnect', requireAuth, (req, res) => {
+  const { platform } = req.body;
+  if (!PLATFORMS.includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
+  disconnectPlatform(platform);
+  res.json({ success: true });
+});
+
+app.get('/api/status', (_req, res) => {
+  const summary = {};
+  PLATFORMS.forEach((p) => {
+    const { status, handle, error } = snapshot(p);
+    summary[p] = { status, handle, error };
+  });
+  res.json(summary);
+});
+
+app.get('/health', (_req, res) => res.status(200).send('OK'));
+
+// ---------------------------------------------------------------------------
+// Overlay URL config:
+//   /overlay.html?twitch=NAME&kick=NAME&youtube=@HANDLE&tiktok=NAME&rumble=URL
+// The overlay page sends these over the socket and the server connects them.
+// Reloading the overlay never restarts a platform already running for the same
+// value, and changes are rate-limited because this endpoint has no password.
+// Optional: set env OVERLAY_KEY and add &key=THAT_VALUE to require it.
+// ---------------------------------------------------------------------------
+const OVERLAY_PLATFORMS = ['twitch', 'kick', 'youtube', 'tiktok', 'rumble'];
+const OVERLAY_COOLDOWN_MS = 15000;
+const overlayState = {}; // platform -> { fp, at }
+
+function applyOverlayConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') return;
+  if (process.env.OVERLAY_KEY) {
+    const given = typeof cfg.key === 'string' ? cfg.key : '';
+    if (!safeEqual(given, process.env.OVERLAY_KEY)) return;
+  }
+  for (const p of OVERLAY_PLATFORMS) {
+    const raw = cfg[p];
+    if (typeof raw !== 'string' || !raw.trim() || raw.length > 400) continue;
+    const handle = raw.trim();
+    const fp = crypto.createHash('sha256').update(handle).digest('hex');
+    const prev = overlayState[p];
+    const status = activeAdapters[p].status;
+
+    if (prev && prev.fp === fp && (status === 'connecting' || status === 'connected')) continue;
+    if (prev && Date.now() - prev.at < OVERLAY_COOLDOWN_MS) continue;
+
+    overlayState[p] = { fp, at: Date.now() };
+    console.log(`[Overlay] Connecting ${p} from overlay URL`); // never log the value (Rumble URLs contain a key)
+    Promise.resolve(connectors[p](handle)).catch((err) => console.error(`[${p}] connect crashed:`, err));
+  }
+}
+
+io.on('connection', (socket) => {
+  PLATFORMS.forEach((p) => socket.emit('statusUpdate', snapshot(p)));
+  socket.on('overlayConnect', applyOverlayConfig);
+});
+
+// ---------------------------------------------------------------------------
+// Start / shutdown
+// ---------------------------------------------------------------------------
+server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: badges-v4]`));
+
+function shutdown() {
+  console.log('Shutting down, stopping adapters...');
+  PLATFORMS.forEach((p) => disconnectPlatform(p, { silent: true }));
+  io.close();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+process.on('unhandledRejection', (err) => console.error('[Unhandled rejection]', err));
