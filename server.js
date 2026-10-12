@@ -99,7 +99,25 @@ function safeAvatar(url, platform) {
   return /^https:\/\//i.test(url) || /^\/[\w./-]+$/.test(url) ? url : fallback;
 }
 
-function normalizeMessage(platform, username, message, avatar = '', id = null) {
+// Badges: [{ type, label, url }]. `type` is a lowercase slug the overlay can
+// style (broadcaster, owner, moderator, vip, subscriber, member, verified, ...);
+// `url` is an https image when the platform provides one, otherwise ''.
+function cleanBadges(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .slice(0, 6)
+    .map((b) => {
+      const o = typeof b === 'string' ? { type: b } : b;
+      if (!o || typeof o !== 'object') return null;
+      const type = String(o.type || o.name || 'badge').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 30) || 'badge';
+      const label = escapeHtml(String(o.label || o.text || o.title || type).slice(0, 40));
+      const url = typeof o.url === 'string' && /^https:\/\//i.test(o.url) ? o.url : '';
+      return { type, label, url };
+    })
+    .filter(Boolean);
+}
+
+function normalizeMessage(platform, username, message, avatar = '', id = null, badges = []) {
   const p = platform.toLowerCase();
   return {
     id: id || `${p}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
@@ -107,6 +125,7 @@ function normalizeMessage(platform, username, message, avatar = '', id = null) {
     username: escapeHtml(username || 'Anonymous'),
     message: escapeHtml(message || ''),
     avatar: safeAvatar(avatar, p),
+    badges: cleanBadges(badges),
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   };
 }
@@ -175,7 +194,7 @@ function startBridge(platform, script, arg, attempt = 0) {
         break;
       case 'message':
         try {
-          broadcastMessage(normalizeMessage(platform, p.username, p.message, p.avatar || '', p.id));
+          broadcastMessage(normalizeMessage(platform, p.username, p.message, p.avatar || '', p.id, p.badges));
         } catch (err) {
           console.error(`[${label}] broadcast failed:`, err);
         }
@@ -469,6 +488,17 @@ const ytText = (t) => {
   return (t.runs || []).map((r) => r.text ?? r.emoji?.shortcuts?.[0] ?? r.emoji?.emojiId ?? '').join('');
 };
 
+function ytBadges(r) {
+  return (r.authorBadges || [])
+    .map((b) => b?.liveChatAuthorBadgeRenderer)
+    .filter(Boolean)
+    .map((b) => {
+      const icon = String(b.icon?.iconType || '').toLowerCase(); // owner | moderator | verified
+      const url = b.customThumbnail?.thumbnails?.slice(-1)[0]?.url || ''; // channel member badge image
+      return { type: icon || (url ? 'member' : 'badge'), label: b.tooltip || icon || 'Member', url };
+    });
+}
+
 function ytItemToMessage(item, isSeen) {
   const paid = Boolean(item?.liveChatPaidMessageRenderer);
   const r = item?.liveChatTextMessageRenderer || item?.liveChatPaidMessageRenderer;
@@ -481,7 +511,7 @@ function ytItemToMessage(item, isSeen) {
   if (paid) text = `\u{1F4B0} ${ytText(r.purchaseAmountText)} ${text}`.trim();
   if (!text) return null;
 
-  return normalizeMessage('youtube', ytText(r.authorName) || 'Viewer', text, r.authorPhoto?.thumbnails?.[0]?.url || '', id);
+  return normalizeMessage('youtube', ytText(r.authorName) || 'Viewer', text, r.authorPhoto?.thumbnails?.[0]?.url || '', id, ytBadges(r));
 }
 
 function ytNextContinuation(conts) {
@@ -700,6 +730,37 @@ function connectTikTok(username) {
 // ---------------------------------------------------------------------------
 // 3. Twitch
 // ---------------------------------------------------------------------------
+const twitchBadgeCache = { global: null, channels: new Map() };
+
+function twitchBadgeSets(url, cacheSet, cacheGet) {
+  const hit = cacheGet();
+  if (hit) return hit;
+  const p = fetch(url, { signal: AbortSignal.timeout(8000) })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((j) => j.badge_sets || {})
+    .catch(() => { cacheSet(null); return {}; }); // retry on the next message
+  cacheSet(p);
+  return p;
+}
+
+// tags.badges looks like { moderator: '1', subscriber: '12' }; the images come
+// from Twitch's public (no auth) badge endpoints and are cached.
+async function twitchBadges(tags) {
+  const raw = tags.badges;
+  if (!raw || typeof raw !== 'object') return [];
+  const room = tags['room-id'];
+  const [glob, chan] = await Promise.all([
+    twitchBadgeSets('https://badges.twitch.tv/v1/badges/global/display', (v) => { twitchBadgeCache.global = v; }, () => twitchBadgeCache.global),
+    room
+      ? twitchBadgeSets(`https://badges.twitch.tv/v1/badges/channels/${encodeURIComponent(room)}/display`, (v) => (v ? twitchBadgeCache.channels.set(room, v) : twitchBadgeCache.channels.delete(room)), () => twitchBadgeCache.channels.get(room))
+      : {}
+  ]);
+  return Object.entries(raw).map(([name, version]) => {
+    const v = chan[name]?.versions?.[version] || glob[name]?.versions?.[version];
+    return { type: name, label: v?.title || name, url: v?.image_url_2x || v?.image_url_1x || '' };
+  });
+}
+
 async function connectTwitch(channel) {
   disconnectPlatform('twitch');
   const chan = String(channel || '').replace(/^#/, '').trim().toLowerCase();
@@ -712,9 +773,12 @@ async function connectTwitch(channel) {
   activeAdapters.twitch.client = client;
   const isCurrent = () => activeAdapters.twitch.client === client;
 
-  client.on('message', (_c, tags, message, self) => {
+  client.on('message', async (_c, tags, message, self) => {
     if (self || !isCurrent()) return;
-    broadcastMessage(normalizeMessage('twitch', tags['display-name'] || tags.username, message, '', tags.id ? `twitch-${tags.id}` : null));
+    let badges = [];
+    try { badges = await twitchBadges(tags); } catch {}
+    if (!isCurrent()) return;
+    broadcastMessage(normalizeMessage('twitch', tags['display-name'] || tags.username, message, '', tags.id ? `twitch-${tags.id}` : null, badges));
   });
   client.on('disconnected', () => {
     if (isCurrent() && activeAdapters.twitch.status !== 'error') updatePlatformStatus('twitch', 'disconnected');
@@ -871,7 +935,8 @@ async function handleKickWebhook(req, res) {
     if (!active || Number(p.broadcaster?.user_id) !== active.broadcasterId) return;
 
     broadcastMessage(
-      normalizeMessage('kick', p.sender?.username, p.content, p.sender?.profile_picture || '', p.message_id ? `kick-${p.message_id}` : null)
+      normalizeMessage('kick', p.sender?.username, p.content, p.sender?.profile_picture || '', p.message_id ? `kick-${p.message_id}` : null,
+        (p.sender?.identity?.badges || []).map((b) => ({ type: b.type, label: b.text || b.type })))
     );
   } catch (err) {
     console.error('[Kick Webhook] Error:', err);
@@ -970,7 +1035,7 @@ async function connectRumble(input) {
           const dollars = m.amount_dollars ?? (m.amount_cents != null ? m.amount_cents / 100 : null);
           text = `\u{1F4B0} Rant${dollars != null ? ` $${Number(dollars).toFixed(2)}` : ''}${text ? `: ${text}` : ''}`;
         }
-        broadcastMessage(normalizeMessage('rumble', m.username, text, '', id));
+        broadcastMessage(normalizeMessage('rumble', m.username, text, '', id, m.badges));
       }
       firstPoll = false;
     } catch (err) {
