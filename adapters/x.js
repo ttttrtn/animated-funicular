@@ -146,6 +146,23 @@ async function bootstrapBroadcast(broadcastId) {
   return { broadcastId, endpoint, accessToken, state: b?.state, title: b?.status };
 }
 
+// Same endpoint the reference client (badlogic/twitter-broadcast-chat) uses to
+// read chat by polling. `since` is a nanosecond timestamp; null = latest.
+async function fetchHistory(b, sinceNs, quick) {
+  const j = await requestJson(`${b.endpoint.replace(/\/$/, '')}/chatapi/v1/history`, {
+    method: 'POST',
+    headers: { ...PSCP_HEADERS, 'x-idempotence': `${Date.now()}` },
+    body: JSON.stringify({
+      access_token: b.accessToken,
+      cursor: '',
+      limit: quick ? 100 : 200,
+      since: sinceNs || null,
+      quick_get: Boolean(quick)
+    })
+  });
+  return Array.isArray(j.messages) ? j.messages : [];
+}
+
 // Parse a JSON string if it is one; pass objects through; else null.
 function tryJson(v) {
   if (v && typeof v === 'object') return v;
@@ -180,7 +197,7 @@ function parseChatFrame(frame, broadcastId) {
     sender.profile_image_url_https, sender.profile_image_url
   );
   const verified = Boolean(inner.verified || sender.verified);
-  return { uuid, username, displayName, text, avatar, verified };
+  return { uuid, username, displayName, text, avatar, verified, ts };
 }
 
 function init(ctx) {
@@ -206,14 +223,55 @@ function init(ctx) {
     let ws = null;
     let pingTimer = null;
     let retryTimer = null;
+    let pollTimer = null;
 
     const stop = () => {
       stopped = true;
       clearTimeout(retryTimer);
+      clearTimeout(pollTimer);
       clearInterval(pingTimer);
       try { ws?.close(); } catch {}
     };
     activeAdapters.x.instance = { stop };
+
+    const emit = (m) => broadcastMessage(normalizeMessage(
+      'x', m.displayName || m.username, m.text, m.avatar, `x-${m.uuid}`,
+      m.verified ? [{ type: 'verified', label: 'Verified' }] : []
+    ));
+
+    // Fallback/primary reader: poll the chat history endpoint. The WebSocket
+    // alone has been seen delivering only viewer-count frames.
+    const startPoll = (b) => {
+      clearTimeout(pollTimer);
+      let lastNs = 0;
+      let first = true;
+      let errs = 0;
+      const tick = async () => {
+        if (stopped || !current()) return;
+        try {
+          const raw = await fetchHistory(b, first ? 0 : lastNs, first);
+          let fresh = 0;
+          for (const f of raw) {
+            const m = parseChatFrame(f, b.broadcastId);
+            if (!m) continue;
+            const ns = m.ts * 1e6;
+            if (ns > lastNs) lastNs = ns;
+            if (isSeen(`x-${m.uuid}`)) continue;
+            if (first) continue; // existing backlog: remember, do not replay
+            fresh += 1;
+            emit(m);
+          }
+          dbg(`history poll: ${raw.length} raw, ${fresh} new${first ? ' (baseline)' : ''}`);
+          first = false;
+          errs = 0;
+        } catch (err) {
+          errs += 1;
+          if (errs <= 3) console.error(`[X] History poll failed (${errs}):`, err?.message || err);
+        }
+        if (!stopped && current()) pollTimer = setTimeout(tick, 3000);
+      };
+      tick();
+    };
 
     const openSocket = (b) => new Promise((resolve) => {
       const url = `${b.endpoint.replace(/^http/, 'ws').replace(/\/$/, '')}/chatapi/v1/chatnow`;
@@ -233,6 +291,7 @@ function init(ctx) {
         }));
         clearInterval(pingTimer);
         pingTimer = setInterval(() => { try { ws.ping(); } catch {} }, 30000);
+        startPoll(b);
         console.log(`[X] Connected to broadcast ${id}${b.title ? ` ("${String(b.title).slice(0, 60)}")` : ''}`);
         if (current()) updatePlatformStatus('x', 'connected', id);
       });
@@ -247,10 +306,7 @@ function init(ctx) {
         const m = parseChatFrame(frame, b.broadcastId);
         if (!m || isSeen(`x-${m.uuid}`)) return;
         msgsSent += 1;
-        broadcastMessage(normalizeMessage(
-          'x', m.displayName || m.username, m.text, m.avatar, `x-${m.uuid}`,
-          m.verified ? [{ type: 'verified', label: 'Verified' }] : []
-        ));
+        emit(m);
       });
 
       // Handshake rejected (bad/expired token, blocked region, wrong endpoint).
@@ -261,6 +317,7 @@ function init(ctx) {
       ws.on('error', (err) => console.error('[X] Socket error:', err?.message || err));
       ws.on('close', (code, reason) => {
         clearInterval(pingTimer);
+        clearTimeout(pollTimer);
         const lived = openedAt ? Date.now() - openedAt : 0;
         console.log(`[X] Socket closed (code ${code}${reason?.length ? `, ${String(reason).slice(0, 80)}` : ''}) after ${lived}ms, ${framesSeen} frames, ${msgsSent} chat messages`);
         if (openedAt && lived >= SHORT_LIVED_MS) fails = 0;
