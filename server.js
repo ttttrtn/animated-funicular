@@ -490,13 +490,77 @@ function ytNextContinuation(conts) {
   return d?.continuation ? { token: d.continuation, wait: d.timeoutMs } : null;
 }
 
-// Gets the first chat continuation from /next (no /player call).
-async function ytChatStart(yt, videoId) {
+const YT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+// Primary method: the public chat popout page (same one used by the chat
+// popout in the browser). It does not use /next or /player, which YouTube
+// blocks with 403 for many server IPs. Returns null if there is no ACTIVE chat.
+async function ytPopoutStart(videoId) {
+  const p = await ytFetchPage(`https://www.youtube.com/live_chat?is_popout=1&v=${videoId}`);
+  if (p.status !== 200) throw new Error(`live_chat page HTTP ${p.status}`);
+  const m = p.html.match(/(?:window\["ytInitialData"\]|var ytInitialData)\s*=\s*(\{.+?\});\s*<\/script>/s);
+  if (!m) throw new Error('live_chat page had no chat data (consent or blocked page?)');
+  let data;
+  try { data = JSON.parse(m[1]); } catch { throw new Error('live_chat data unreadable'); }
+  const lc = data?.contents?.liveChatRenderer;
+  if (!lc || lc.isReplay) return null;
+  const next = ytNextContinuation(lc.continuations);
+  if (!next) return null;
+  const apiKey = p.html.match(/"INNERTUBE_API_KEY":"([\w-]+)"/)?.[1];
+  const clientVersion =
+    p.html.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION":"([\d.]+)"/)?.[1] || p.html.match(/"clientVersion":"([\d.]+)"/)?.[1];
+  if (!apiKey || !clientVersion) throw new Error('live_chat page missing API key or client version');
+  return { mode: 'popout', next, apiKey, clientVersion };
+}
+
+// Fallback: Innertube /next (blocked with 403 on some hosts).
+async function ytNextStart(yt, videoId) {
   const res = await yt.actions.execute('/next', { videoId });
   const data = res?.data || res;
   const lc = data?.contents?.twoColumnWatchNextResults?.conversationBar?.liveChatRenderer;
   if (!lc || lc.isReplay) return null;
-  return ytNextContinuation(lc.continuations);
+  const next = ytNextContinuation(lc.continuations);
+  return next ? { mode: 'innertube', next } : null;
+}
+
+// Returns { mode, next, ... } for an active chat, or null if none.
+async function ytChatStart(yt, videoId) {
+  let popErr = null;
+  try {
+    return await ytPopoutStart(videoId);
+  } catch (e) {
+    popErr = e;
+    console.error(`[YouTube] Popout chat page failed for ${videoId}:`, e?.message || e);
+  }
+  try {
+    return await ytNextStart(yt, videoId);
+  } catch (e) {
+    throw new Error(`${popErr.message} | fallback: ${e?.message || e}`);
+  }
+}
+
+async function ytChatPoll(yt, chat) {
+  if (chat.mode === 'popout') {
+    const r = await fetch(`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${chat.apiKey}&prettyPrint=false`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': YT_UA,
+        Origin: 'https://www.youtube.com',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Cookie: 'SOCS=CAI; CONSENT=YES+1'
+      },
+      body: JSON.stringify({
+        context: { client: { clientName: 'WEB', clientVersion: chat.clientVersion, hl: 'en', gl: 'US' } },
+        continuation: chat.next.token
+      }),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!r.ok) throw new Error(`get_live_chat HTTP ${r.status}`);
+    return r.json();
+  }
+  const res = await yt.actions.execute('/live_chat/get_live_chat', { continuation: chat.next.token });
+  return res?.data || res;
 }
 
 async function connectYouTube(input) {
@@ -553,9 +617,9 @@ async function runYouTube(targets, token, label) {
     }
 
     // 2. Get the chat continuation (skips the blocked /player endpoint).
-    let next = await ytChatStart(yt, videoId);
+    const chat = await ytChatStart(yt, videoId);
     if (!current()) return;
-    if (!next) {
+    if (!chat) {
       return watching ? retryLater('No live chat yet') : fail('That video has no live chat right now');
     }
 
@@ -584,8 +648,7 @@ async function runYouTube(targets, token, label) {
       if (stopped || !current()) return;
       let delay = 2000;
       try {
-        const res = await yt.actions.execute('/live_chat/get_live_chat', { continuation: next.token });
-        const data = res?.data || res;
+        const data = await ytChatPoll(yt, chat);
         const lcc = data?.continuationContents?.liveChatContinuation;
         if (!lcc) return finish('Stream ended');
 
@@ -598,7 +661,7 @@ async function runYouTube(targets, token, label) {
 
         const n = ytNextContinuation(lcc.continuations);
         if (!n) return finish('Stream ended');
-        next = n;
+        chat.next = n;
         delay = Math.min(Math.max(Number(n.wait) || 2000, 1000), 8000);
       } catch (err) {
         failures += 1;
@@ -610,7 +673,7 @@ async function runYouTube(targets, token, label) {
     };
 
     adapter().instance = { stop: () => { stopped = true; clearTimeout(timer); } };
-    console.log(`[YouTube] Connected to live chat of video ${videoId}`);
+    console.log(`[YouTube] Connected to live chat of video ${videoId} (${chat.mode})`);
     updatePlatformStatus('youtube', 'connected', label);
     poll();
   } catch (err) {
