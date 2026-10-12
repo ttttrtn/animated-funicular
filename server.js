@@ -359,6 +359,55 @@ async function ytFeedVideoIds(channelId) {
   }
 }
 
+const YT_STREAMS_TAB = 'EgdzdHJlYW1z8gYECgJ6AA%3D%3D'; // "streams" tab of a channel
+const YT_API_KEY = process.env.YOUTUBE_API_KEY; // optional, official Data API v3
+
+// Raw browse of the channel's Streams tab. Regexes the JSON instead of relying
+// on the library's parser classes, which break whenever YouTube changes layout.
+async function ytStreamsTabIds(yt, channelId) {
+  try {
+    const res = await yt.actions.execute('/browse', { browseId: channelId, params: YT_STREAMS_TAB });
+    const json = JSON.stringify(res?.data || res || {});
+    const live = [];
+    const rest = [];
+    const seen = new Set();
+    for (const m of json.matchAll(/"videoId":"([\w-]{11})"/g)) {
+      if (seen.has(m[1])) continue;
+      seen.add(m[1]);
+      const near = json.slice(m.index, m.index + 3000);
+      (/BADGE_STYLE_TYPE_LIVE_NOW|"style":"LIVE"|LIVE_NOW/.test(near) ? live : rest).push(m[1]);
+    }
+    console.log(`[YouTube] Raw streams tab ${channelId}: ${json.length} bytes, ${seen.size} video id(s), ${live.length} flagged live`);
+    return [...live, ...rest].slice(0, 8);
+  } catch (err) {
+    console.error('[YouTube] Raw streams tab failed:', err?.message || err);
+    return [];
+  }
+}
+
+// Optional: official API (set env YOUTUBE_API_KEY). 2 quota units per check.
+async function ytApiLiveIds(channelId) {
+  if (!YT_API_KEY || !/^UC/.test(channelId)) return [];
+  const get = async (url) => {
+    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`YouTube API ${r.status}: ${j?.error?.message || 'error'}`);
+    return j;
+  };
+  try {
+    const pl = await get(`https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=8&playlistId=UU${channelId.slice(2)}&key=${YT_API_KEY}`);
+    const ids = (pl.items || []).map((i) => i.contentDetails?.videoId).filter(Boolean);
+    if (!ids.length) return [];
+    const v = await get(`https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${ids.join(',')}&key=${YT_API_KEY}`);
+    const live = (v.items || []).filter((x) => x.snippet?.liveBroadcastContent === 'live').map((x) => x.id);
+    console.log(`[YouTube] Data API ${channelId}: ${ids.length} recent upload(s), ${live.length} live`);
+    return live;
+  } catch (err) {
+    console.error('[YouTube] Data API failed:', err?.message || err);
+    return [];
+  }
+}
+
 // Collects candidate video IDs from several sources, then keeps the first one
 // that really has an ACTIVE live chat (ended streams only have a replay chat).
 async function findLiveVideoId(yt, t) {
@@ -374,6 +423,8 @@ async function findLiveVideoId(yt, t) {
   if (!channelId && !candidates.length) throw codeErr('NOT_FOUND', `YouTube channel ${t.label} not found`);
 
   if (channelId) {
+    for (const id of await ytApiLiveIds(channelId)) add(id, 'Data API');
+    for (const id of await ytStreamsTabIds(yt, channelId)) add(id, 'raw streams tab');
     // 2. Innertube channel tabs.
     try {
       const channel = await yt.getChannel(channelId);
