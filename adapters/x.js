@@ -249,11 +249,15 @@ function init(ctx) {
       const tick = async () => {
         if (stopped || !current()) return;
         try {
-          const raw = await fetchHistory(b, first ? 0 : lastNs, first);
+          const raw = await fetchHistory(b, 0, false);
           let fresh = 0;
           for (const f of raw) {
             const m = parseChatFrame(f, b.broadcastId);
-            if (!m) continue;
+            if (!m) {
+              const key = `skip:${(f && f.payload) || JSON.stringify(f)}`.slice(0, 300);
+              if (DEBUG() && !isSeen(key)) console.log('[X][debug] history item not parsed as chat:', JSON.stringify(f).slice(0, 500));
+              continue;
+            }
             const ns = m.ts * 1e6;
             if (ns > lastNs) lastNs = ns;
             if (isSeen(`x-${m.uuid}`)) continue;
