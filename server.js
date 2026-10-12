@@ -111,7 +111,7 @@ function cleanBadges(list) {
       if (!o || typeof o !== 'object') return null;
       const type = String(o.type || o.name || 'badge').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 30) || 'badge';
       const label = escapeHtml(String(o.label || o.text || o.title || type).slice(0, 40));
-      const url = typeof o.url === 'string' && (/^https:\/\//i.test(o.url) || /^\/icons\/[\w./-]+\.svg$/.test(o.url)) ? o.url : '';
+      const url = typeof o.url === 'string' && (/^https:\/\//i.test(o.url) || /^\/icons\/(?:[\w-]+\/)*[\w-]+\.svg$/.test(o.url)) ? o.url : '';
       return { type, label, url };
     })
     .filter(Boolean);
