@@ -280,7 +280,7 @@ function youTubeTargets(input) {
   return [];
 }
 
-const ytFetchHtml = async (url) => {
+const ytFetchPage = async (url) => {
   const res = await fetch(url, {
     headers: {
       'Accept-Language': 'en-US,en;q=0.9',
@@ -289,8 +289,9 @@ const ytFetchHtml = async (url) => {
     },
     signal: AbortSignal.timeout(10000)
   });
-  return res.text();
+  return { status: res.status, url: res.url || url, html: await res.text() };
 };
+const ytFetchHtml = async (url) => (await ytFetchPage(url)).html;
 
 async function channelIdFromHandle(yt, handle) {
   try {
@@ -316,14 +317,18 @@ function pickLiveVideoId(videos) {
   return null;
 }
 
-// Fallback: <channel>/live redirects to the current stream when there is one.
+// <channel>/live redirects to the current stream when there is one.
 async function liveIdFromLivePage(pathPart) {
   try {
-    const html = await ytFetchHtml(`https://www.youtube.com/${pathPart}/live`);
-    const m = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
-    if (!m) return null;
-    return m[1];
-  } catch {
+    const p = await ytFetchPage(`https://www.youtube.com/${pathPart}/live`);
+    const fromUrl = p.url.match(/[?&]v=([\w-]{11})/);
+    const fromCanon = p.html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
+    const id = fromUrl?.[1] || fromCanon?.[1] || null;
+    const wall = /consent\.youtube\.com/.test(p.url) ? ' (CONSENT WALL)' : '';
+    console.log(`[YouTube] /live page ${pathPart}: HTTP ${p.status}, ${p.html.length} bytes, final URL ${p.url.slice(0, 90)}, video ${id || 'none'}${wall}`);
+    return id;
+  } catch (err) {
+    console.error(`[YouTube] /live page ${pathPart} failed:`, err?.message || err);
     return null;
   }
 }
@@ -335,10 +340,12 @@ async function ytFeedVideoIds(channelId) {
       headers: { 'User-Agent': 'Mozilla/5.0' },
       signal: AbortSignal.timeout(10000)
     });
-    if (!res.ok) return [];
     const xml = await res.text();
-    return [...xml.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)].map((m) => m[1]).slice(0, 6);
-  } catch {
+    const ids = [...xml.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)].map((m) => m[1]).slice(0, 6);
+    console.log(`[YouTube] RSS feed ${channelId}: HTTP ${res.status}, ${ids.length} video(s)`);
+    return res.ok ? ids : [];
+  } catch (err) {
+    console.error('[YouTube] RSS feed failed:', err?.message || err);
     return [];
   }
 }
@@ -350,6 +357,7 @@ async function findLiveVideoId(yt, t) {
   const add = (id, src) => { if (id && YT_VIDEO_ID.test(id) && !candidates.some((c) => c.id === id)) candidates.push({ id, src }); };
 
   let channelId = t.type === 'handle' ? await channelIdFromHandle(yt, t.value) : t.value;
+  console.log(`[YouTube] ${t.label}: channel id ${channelId || 'NOT RESOLVED'}`);
 
   // 1. The channel's /live page redirects to the current stream.
   add(await liveIdFromLivePage(t.type === 'handle' ? `@${t.value}` : `channel/${t.value}`), '/live page');
@@ -362,6 +370,7 @@ async function findLiveVideoId(yt, t) {
       const channel = await yt.getChannel(channelId);
       if (channel.has_live_streams) add(pickLiveVideoId((await channel.getLiveStreams()).videos), 'Innertube streams tab');
       add(pickLiveVideoId(channel.videos), 'Innertube home');
+      console.log(`[YouTube] Innertube channel ${channelId}: live tab ${channel.has_live_streams ? 'yes' : 'no'}, home items ${(channel.videos || []).length}`);
     } catch (err) {
       console.error('[YouTube] Channel lookup failed:', err?.message || err);
     }
