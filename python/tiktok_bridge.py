@@ -17,7 +17,7 @@ username = sys.argv[1].replace("@", "").strip()
 OFFLINE_RETRY_S = 30      # streamer not live yet: check again every 30s
 ERROR_RETRY_MIN_S = 5
 ERROR_RETRY_MAX_S = 120
-BADGE_DEBUG_LIMIT = 3     # log the raw badge scene names for the first few chat events
+BADGE_DEBUG_LIMIT = 3     # log the raw badge structure for the first few chat events
 
 
 def emit(obj):
@@ -52,10 +52,37 @@ def display_name(user):
 
 
 # ---------------------------------------------------------------------------
-# Badges. Every access is defensive: TikTokLive's protobuf classes change
-# between versions, and a missing attribute must never kill a chat event.
+# Badges.
+#
+# TikTokLive (v6.x, betterproto2) exposes badges as `user.badge_list`, a list
+# of BadgeStruct. (`user.badges` is only a legacy alias of the same list.)
+# A BadgeStruct has:
+#   badge_scene            enum  (NOT "badge_scene_type")
+#   image_badge.image      ImageModel  -> url_list / uri
+#   text_badge             .default_pattern
+#   string_badge           string badge
+#   combine_badge_struct   .icon (ImageModel) + .text  (fan club, gifter level)
+# Depending on the generated proto version the content fields can also be named
+# image / text / str / combine (a protobuf oneof), so both spellings are tried.
+# Every access is defensive: one missing attribute must never kill a chat event.
 # ---------------------------------------------------------------------------
 _badge_debug_left = BADGE_DEBUG_LIMIT
+
+
+def _safe(obj, name, default=None):
+    try:
+        v = getattr(obj, name, default)
+    except Exception:
+        return default
+    return default if callable(v) else v
+
+
+def _first_attr(obj, *names):
+    for n in names:
+        v = _safe(obj, n)
+        if v is not None:
+            return v
+    return None
 
 
 def _scene_name(scene):
@@ -66,61 +93,136 @@ def _scene_name(scene):
     return str(name if name else scene).lower()
 
 
-def _first_url(img):
-    urls = getattr(img, "url_list", None) if img else None
-    if urls:
-        url = str(urls[0])
-        return url if url.startswith("https://") else ""
+def _image_info(img):
+    """(https url, uri) of an ImageModel; ('', '') if there is none."""
+    if img is None:
+        return "", ""
+    url = ""
+    for u in _safe(img, "url_list") or []:
+        u = str(u)
+        if u.startswith("https://"):
+            url = u
+        elif u.startswith("http://"):
+            url = "https://" + u[7:]   # TikTok CDNs serve https; the server only accepts https
+        elif u.startswith("//"):
+            url = "https:" + u
+        if url:
+            break
+    return url, str(_safe(img, "uri", "") or "")
+
+
+def _classify(*hints):
+    """Map scene name / image uri / text to a type the overlay can style."""
+    h = " ".join(str(x).lower() for x in hints if x)
+    if "moderator" in h or "admin" in h:
+        return "moderator"
+    if "subscri" in h:
+        return "subscriber"
+    if "gifter" in h or "rank" in h or "grade" in h or "pay_" in h:
+        return "gifter"
+    if "fans" in h or "fanclub" in h or "member" in h:
+        return "fan"
     return ""
+
+
+def _extract_badge(b):
+    """One BadgeStruct -> (scene, url, uri, text)."""
+    scene = _scene_name(_first_attr(b, "badge_scene", "badge_scene_type"))
+    url = uri = text = ""
+
+    img = _first_attr(b, "image_badge", "image")
+    if img is not None:
+        url, uri = _image_info(_safe(img, "image") or img)
+
+    tb = _first_attr(b, "text_badge", "text")
+    if tb is not None:
+        text = str(_safe(tb, "default_pattern", "") or "")
+
+    sb = _first_attr(b, "string_badge", "str")
+    if sb is not None and not text:
+        text = sb if isinstance(sb, str) else str(_safe(sb, "str", "") or "")
+
+    cb = _first_attr(b, "combine_badge_struct", "combine")
+    if cb is not None:
+        if not url:
+            url, uri = _image_info(_safe(cb, "icon"))
+        if not text:
+            t = _safe(cb, "text")
+            text = str(_safe(t, "default_pattern", "") or _safe(cb, "str", "") or "")
+
+    if "{" in text:       # unresolved template such as "{0:string}"
+        text = ""
+    return scene, url, uri, text
 
 
 def badges_of(user):
     global _badge_debug_left
     out, seen = [], set()
 
-    def add(kind, label="", url=""):
-        key = (kind, url)
-        if key in seen or len(out) >= 6:
+    def add(kind, label="", url="", uri=""):
+        key = uri or url or kind
+        if (kind, key) in seen:
             return
-        seen.add(key)
+        # A role we already know from a property (moderator, subscriber, ...)
+        # is upgraded in place when the real image badge shows up, never doubled.
+        for existing in out:
+            if existing["type"] == kind and not existing["url"] and kind != "badge":
+                if url:
+                    existing["url"] = url
+                    existing["label"] = existing["label"] if label in ("", kind) else label
+                seen.add((kind, key))
+                return
+        if len(out) >= 6:
+            return
+        seen.add((kind, key))
         out.append({"type": kind, "label": label or kind, "url": url})
 
-    if (getattr(user, "unique_id", "") or "").lower() == username.lower():
+    handle = str(_safe(user, "unique_id", "") or _safe(user, "display_id", "") or "")
+    if handle and handle.lower() == username.lower():
         add("broadcaster", "Streamer")
-    if getattr(user, "is_moderator", False) is True:
+    if _safe(user, "is_moderator", False) is True:
         add("moderator", "Moderator")
-    if getattr(user, "is_subscriber", False) is True:
+    if _safe(user, "is_subscriber", False) is True:
         add("subscriber", "Subscriber")
 
     raw = []
-    for attr in ("badges", "badge_list"):
-        value = getattr(user, attr, None)
-        if value and not callable(value):
+    for attr in ("badge_list", "badges"):          # badge_list first; badges is a legacy alias
+        value = _safe(user, attr)
+        if value:
             try:
-                raw.extend(list(value))
+                raw = list(value)
+                break
             except Exception:
                 pass
 
-    scenes = []
+    debug = []
+    image_found = False
     for b in raw:
         try:
-            scene = _scene_name(getattr(b, "badge_scene_type", None))
-            scenes.append(scene)
-            if "admin" in scene or "moderator" in scene:
-                kind = "moderator"
-            elif "subscriber" in scene:
-                kind = "subscriber"
-            else:
-                kind = re.sub(r"[^a-z0-9_-]", "", scene.replace(" ", "_")) or "badge"
-            image = getattr(getattr(b, "image_badge", None), "image", None)
-            text = getattr(getattr(b, "text_badge", None), "default_pattern", "") or ""
-            add(kind, str(text) or kind, _first_url(image))
-        except Exception:
-            continue
+            scene, url, uri, text = _extract_badge(b)
+            kind = _classify(scene, uri, text) or re.sub(r"[^a-z0-9_-]", "", scene) or "badge"
+            debug.append(f"{scene or '?'}|{kind}|uri={uri[:40] or '-'}|img={'y' if url else 'n'}|text={text[:20] or '-'}")
+            if not (url or text) and kind == "badge":
+                continue                            # nothing to show
+            image_found = image_found or bool(url)
+            add(kind, text or kind, url, uri)
+        except Exception as e:
+            debug.append(f"error:{type(e).__name__}")
+
+    # Legacy ImageModel lists: only used when the structured badges gave no image.
+    if not image_found:
+        for attr in ("badge_image_list", "media_badge_image_list"):
+            for img in _safe(user, attr) or []:
+                try:
+                    url, uri = _image_info(img)
+                    if url:
+                        add(_classify(uri) or "badge", "", url, uri)
+                except Exception:
+                    continue
 
     if _badge_debug_left > 0:
         _badge_debug_left -= 1
-        log(f"badge debug for @{getattr(user, 'unique_id', '?')}: scenes={scenes} -> {[b['type'] for b in out]}")
+        log(f"badge debug @{handle or '?'}: {len(raw)} raw -> {debug} => {[b['type'] for b in out]}")
     return out
 
 
