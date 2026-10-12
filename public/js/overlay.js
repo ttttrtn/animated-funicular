@@ -6,10 +6,11 @@ const fontSize = params.get('fontSize') || '20px';
 const showBadges = params.get('badges') !== '0'; // add &badges=0 to hide badges
 
 // ---- Connect platforms from the URL ---------------------------------------
-// /overlay.html?twitch=NAME&kick=NAME&youtube=@HANDLE&tiktok=NAME&rumble=URL_OR_KEY
+// /overlay.html?twitch=NAME&kick=NAME&youtube=@HANDLE&tiktok=NAME&rumble=URL_OR_KEY&x=BROADCAST_URL
+// (facebook=... and instagram=@NAME also need the server's OVERLAY_KEY and &key=...)
 // (&key=... only if the server has OVERLAY_KEY set; &debug=1 shows connection status)
 const config = {};
-['twitch', 'kick', 'youtube', 'tiktok', 'rumble', 'key'].forEach((k) => {
+['twitch', 'kick', 'youtube', 'tiktok', 'rumble', 'x', 'facebook', 'instagram', 'key'].forEach((k) => {
   const v = params.get(k);
   if (v && v.trim()) config[k] = v.trim();
 });
@@ -62,7 +63,7 @@ const BADGE_ICONS = {
 
 // Badge images: https (Twitch, YouTube, TikTok, Kick custom sub badges) or the
 // icons this server hosts itself (/icons/kick/*.svg, /icons/tiktok/*.svg).
-const BADGE_URL = /^(https:\/\/|\/icons\/(?:[\w-]+\/)*[\w-]+\.svg$)/i;
+const BADGE_URL = /^(https:\/\/|\/icons\/(?:[\w-]+\/)*[\w-]+\.(?:svg|png|webp|gif|jpg)$)/i;
 
 function emojiBadge(type) {
   if (!BADGE_ICONS[type]) return null;
