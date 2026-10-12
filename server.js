@@ -452,7 +452,115 @@ async function handleKickWebhook(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// 5 & 6. Facebook / Rumble: not implemented. The old version showed a fake
+// 6. Rumble: official Live Stream API (polled). Works for YOUR OWN channel only
+// and only while you are live. Get the URL at rumble.com/account/livestream-api
+// (it contains your secret key). Paste the full URL (or just the key) into the
+// dashboard, or put it in env RUMBLE_API_URL and type "env" as the handle.
+// The URL/key is never stored in the status `handle`, so it is not broadcast
+// to overlay viewers or shown by /api/status.
+// ---------------------------------------------------------------------------
+const RUMBLE_POLL_MS = 4000;
+
+function resolveRumbleUrl(input) {
+  let v = String(input || '').trim();
+  if (v.toLowerCase() === 'env') v = process.env.RUMBLE_API_URL || process.env.RUMBLE_API_KEY || '';
+  if (!v) return null;
+  try {
+    let u;
+    if (/^https?:\/\//i.test(v)) {
+      u = new URL(v);
+    } else if (/^[\w-]{8,}$/.test(v)) {
+      u = new URL('https://rumble.com/-livestream-api/get-data');
+      u.searchParams.set('key', v);
+    } else {
+      return null;
+    }
+    const hostOk = u.hostname === 'rumble.com' || u.hostname.endsWith('.rumble.com');
+    return u.protocol === 'https:' && hostOk ? u : null; // blocks requests to other hosts
+  } catch {
+    return null;
+  }
+}
+
+async function connectRumble(input) {
+  disconnectPlatform('rumble');
+  const url = resolveRumbleUrl(input);
+  if (!url) {
+    return updatePlatformStatus('rumble', 'error', '', 'Paste your Rumble Live Stream API URL (rumble.com/account/livestream-api) or key');
+  }
+
+  const token = Symbol('rumble');
+  activeAdapters.rumble.token = token;
+  updatePlatformStatus('rumble', 'connecting', 'Rumble');
+
+  const seen = new Set();
+  let firstPoll = true;
+  let failures = 0;
+  let wasLive = null;
+  const current = () => activeAdapters.rumble.token === token;
+
+  const poll = async () => {
+    if (!current()) return;
+    let delay = RUMBLE_POLL_MS;
+    try {
+      const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+      if ([401, 403, 404].includes(res.status)) {
+        // Wrong or revoked key: retrying will not help.
+        return updatePlatformStatus('rumble', 'error', '', `Rumble rejected the API key (HTTP ${res.status}). Reset it at rumble.com/account/livestream-api`);
+      }
+      if (!res.ok) throw new Error(`Rumble API returned HTTP ${res.status}`);
+      const data = await res.json();
+      if (!current()) return;
+
+      failures = 0;
+      if (activeAdapters.rumble.status !== 'connected') {
+        updatePlatformStatus('rumble', 'connected', data.username || 'Rumble');
+      }
+
+      const streams = Array.isArray(data.livestreams) ? data.livestreams : [];
+      const stream = streams.find((s) => s?.is_live) || streams[0];
+      const live = Boolean(stream?.is_live);
+      if (live !== wasLive) {
+        console.log(`[Rumble] ${live ? 'Stream is live' : 'No live stream right now (chat only appears while live)'}`);
+        wasLive = live;
+      }
+
+      const chat = stream?.chat || {};
+      const items = [
+        ...(chat.recent_messages || []).map((m) => ({ ...m, _rant: false })),
+        ...(chat.recent_rants || []).map((m) => ({ ...m, _rant: true }))
+      ].sort((a, b) => String(a.created_on || '').localeCompare(String(b.created_on || '')));
+
+      for (const m of items) {
+        const id = `rumble-${m._rant ? 'rant-' : ''}${m.id ?? `${m.username}-${m.created_on}-${m.text}`}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        if (seen.size > 2000) seen.delete(seen.values().next().value);
+        if (firstPoll) continue; // existing backlog: remember it, do not replay it
+        if (!m.text && !m._rant) continue;
+
+        let text = m.text || '';
+        if (m._rant) {
+          const dollars = m.amount_dollars ?? (m.amount_cents != null ? m.amount_cents / 100 : null);
+          text = `\u{1F4B0} Rant${dollars != null ? ` $${Number(dollars).toFixed(2)}` : ''}${text ? `: ${text}` : ''}`;
+        }
+        broadcastMessage(normalizeMessage('rumble', m.username, text, '', id));
+      }
+      firstPoll = false;
+    } catch (err) {
+      failures += 1;
+      console.error(`[Rumble] Poll failed (${failures}):`, err?.message || err);
+      delay = Math.min(RUMBLE_POLL_MS * 2 ** Math.min(failures, 3), 30000);
+      if (failures === 3 && current()) updatePlatformStatus('rumble', 'error', '', `Rumble API unreachable: ${err?.message || err}`);
+    }
+    if (current()) activeAdapters.rumble.timer = setTimeout(poll, delay);
+  };
+
+  poll();
+}
+
+// ---------------------------------------------------------------------------
+// 5. Facebook: not implemented. The old version showed a fake
 // "connected" status every 5 s, which was misleading, so they now report it.
 // ---------------------------------------------------------------------------
 function connectUnsupported(platform, handle) {
@@ -492,7 +600,7 @@ const connectors = {
   twitch: connectTwitch,
   kick: connectKick,
   facebook: (h) => connectUnsupported('facebook', h),
-  rumble: (h) => connectUnsupported('rumble', h)
+  rumble: connectRumble
 };
 
 app.post('/api/connect', requireAuth, (req, res) => {
