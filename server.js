@@ -433,6 +433,7 @@ async function connectYouTube(input) {
   }
   const token = Symbol('yt');
   activeAdapters.youtube.token = token;
+  console.log(`[YouTube] Connecting: ${targets.map((t) => `${t.type}:${t.value}`).join(', ')}`);
   updatePlatformStatus('youtube', 'connecting', targets[0].label);
   runYouTube(targets, token, targets[0].label);
 }
@@ -967,7 +968,7 @@ io.on('connection', (socket) => {
 // ---------------------------------------------------------------------------
 // Start / shutdown
 // ---------------------------------------------------------------------------
-server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT}`));
+server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: yt-candidates-v3]`));
 
 function shutdown() {
   console.log('Shutting down, stopping adapters...');
