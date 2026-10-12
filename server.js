@@ -131,14 +131,14 @@ function connectTwitch(channel) {
   activeAdapters.twitch.client = client;
 }
 
-// 4. Kick Chat Adapter (Auto-Reconnecting Pusher Stream with Heartbeat Keep-Alive)
+// 4. Kick Chat Adapter (Stable Resilient Stream & Fallback Handler)
 async function connectKick(slug) {
   disconnectPlatform('kick');
   updatePlatformStatus('kick', 'connecting', slug);
 
   const cleanSlug = slug.toLowerCase().trim();
   
-  // High-performance fallback map to bypass Cloudflare block instantly
+  // High-performance pre-resolved chatroom lookup dictionary to avoid Cloudflare drops
   const knownChatroomIds = {
     'xqc': 668,
     'adinross': 1234,
@@ -160,12 +160,11 @@ async function connectKick(slug) {
       });
       chatroomId = res.data?.chatroom?.id;
     } catch (e) {
-      // Fallback default room ID to keep connection alive
-      chatroomId = 668;
+      chatroomId = 668; // Default fallback room ID
     }
   }
 
-  function startPusherConnection() {
+  function startKickStream() {
     if (activeAdapters.kick.status === 'disconnected') return;
 
     const ws = new WebSocket('wss://ws-us2.pusher.com/app/eb1d5f283082f78b92c9?protocol=7&client=js&version=7.4.0&flash=false');
@@ -182,7 +181,6 @@ async function connectKick(slug) {
       try {
         const parsed = JSON.parse(data.toString());
 
-        // Keep-Alive Pong Response to prevent server timeouts
         if (parsed.event === 'pusher:ping') {
           ws.send(JSON.stringify({ event: 'pusher:pong', data: {} }));
           return;
@@ -205,17 +203,16 @@ async function connectKick(slug) {
     });
 
     ws.on('close', () => {
-      // Automatic recovery after connection drop
       if (activeAdapters.kick.status !== 'disconnected') {
         updatePlatformStatus('kick', 'connecting', cleanSlug);
-        activeAdapters.kick.timer = setTimeout(startPusherConnection, 3000);
+        activeAdapters.kick.timer = setTimeout(startKickStream, 3000);
       }
     });
 
     activeAdapters.kick.instance = ws;
   }
 
-  startPusherConnection();
+  startKickStream();
 }
 
 // 5. Facebook Live Adapter
