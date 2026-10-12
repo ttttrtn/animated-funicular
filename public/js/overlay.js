@@ -38,7 +38,7 @@ const decode = (s) =>
     .replace(/&#39;/g, "'")
     .replace(/&amp;/g, '&');
 
-// Fallback icons for badges that come without an image (Kick, some TikTok/YouTube).
+// Last-resort emoji for badges whose image is missing or fails to load.
 // Unknown types without an image are not shown.
 const BADGE_ICONS = {
   broadcaster: '🎙️',
@@ -52,9 +52,25 @@ const BADGE_ICONS = {
   og: '🏅',
   staff: '🛡️',
   admin: '🛡️',
+  sidekick: '🛡️',
   sub_gifter: '🎁',
+  subgifter: '🎁',
+  gifter: '💎',
+  fan: '💗',
   fans: '💗'
 };
+
+// Badge images: https (Twitch, YouTube, TikTok, Kick custom sub badges) or the
+// icons this server hosts itself (/icons/kick/*.svg, /icons/tiktok/*.svg).
+const BADGE_URL = /^(https:\/\/|\/icons\/(?:[\w-]+\/)*[\w-]+\.svg$)/i;
+
+function emojiBadge(type) {
+  if (!BADGE_ICONS[type]) return null;
+  const el = document.createElement('span');
+  el.className = 'badge-icon';
+  el.textContent = BADGE_ICONS[type];
+  return el;
+}
 
 function buildBadges(list) {
   if (!showBadges || !Array.isArray(list) || !list.length) return null;
@@ -67,16 +83,24 @@ function buildBadges(list) {
     const label = decode(b.label || type);
     let el = null;
 
-    if (typeof b.url === 'string' && /^https:\/\//i.test(b.url)) {
+    if (typeof b.url === 'string' && BADGE_URL.test(b.url)) {
       el = document.createElement('img');
       el.className = 'badge';
       el.src = b.url;
       el.alt = label;
-      el.onerror = () => el.remove();
-    } else if (BADGE_ICONS[type]) {
-      el = document.createElement('span');
-      el.className = 'badge-icon';
-      el.textContent = BADGE_ICONS[type];
+      el.onerror = () => {
+        // Image failed: swap in the emoji for that type, or drop it.
+        const fallback = emojiBadge(type);
+        if (fallback) {
+          fallback.title = label;
+          if (type) fallback.classList.add(`badge-${type}`);
+          el.replaceWith(fallback);
+        } else {
+          el.remove();
+        }
+      };
+    } else {
+      el = emojiBadge(type);
     }
 
     if (!el) continue;
