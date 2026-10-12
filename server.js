@@ -323,7 +323,16 @@ async function liveIdFromLivePage(pathPart) {
     const p = await ytFetchPage(`https://www.youtube.com/${pathPart}/live`);
     const fromUrl = p.url.match(/[?&]v=([\w-]{11})/);
     const fromCanon = p.html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
-    const id = fromUrl?.[1] || fromCanon?.[1] || null;
+    let id = fromUrl?.[1] || fromCanon?.[1] || null;
+    if (!id) {
+      // Watch-page data embedded in the HTML: videoDetails followed by isLive:true.
+      const i = p.html.indexOf('"videoDetails":{"videoId":"');
+      if (i !== -1) {
+        const chunk = p.html.slice(i, i + 4000);
+        const m = chunk.match(/"videoId":"([\w-]{11})"/);
+        if (m && /"isLive":true/.test(chunk)) id = m[1];
+      }
+    }
     const wall = /consent\.youtube\.com/.test(p.url) ? ' (CONSENT WALL)' : '';
     console.log(`[YouTube] /live page ${pathPart}: HTTP ${p.status}, ${p.html.length} bytes, final URL ${p.url.slice(0, 90)}, video ${id || 'none'}${wall}`);
     return id;
@@ -368,7 +377,12 @@ async function findLiveVideoId(yt, t) {
     // 2. Innertube channel tabs.
     try {
       const channel = await yt.getChannel(channelId);
-      if (channel.has_live_streams) add(pickLiveVideoId((await channel.getLiveStreams()).videos), 'Innertube streams tab');
+      if (channel.has_live_streams) {
+        const vids = (await channel.getLiveStreams()).videos || [];
+        console.log(`[YouTube] Innertube live tab: ${vids.length} item(s)`);
+        add(pickLiveVideoId(vids), 'Innertube streams tab (live badge)');
+        vids.slice(0, 5).forEach((v) => add(v?.video_id || v?.id || v?.content_id, 'Innertube streams tab'));
+      }
       add(pickLiveVideoId(channel.videos), 'Innertube home');
       console.log(`[YouTube] Innertube channel ${channelId}: live tab ${channel.has_live_streams ? 'yes' : 'no'}, home items ${(channel.videos || []).length}`);
     } catch (err) {
