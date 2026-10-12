@@ -2,7 +2,7 @@ const socket = io();
 const container = document.getElementById('overlayChatContainer');
 const params = new URLSearchParams(window.location.search);
 const maxMessages = parseInt(params.get('maxMessages') || '8', 10);
-const fontSize = params.get('fontSize') || '15px';
+const fontSize = params.get('fontSize') || '20px';
 const showBadges = params.get('badges') !== '0'; // add &badges=0 to hide badges
 
 // ---- Connect platforms from the URL ---------------------------------------
