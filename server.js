@@ -17,8 +17,8 @@ const PORT = process.env.PORT || 3000;
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
 
 // ---------------------------------------------------------------------------
-// Auth: password comes from the environment only (no hardcoded default).
-// If DASHBOARD_PASS is not set, a random one is generated and printed once.
+// Auth: password from the environment only. If DASHBOARD_PASS is not set, a
+// random one is generated and printed once.
 // ---------------------------------------------------------------------------
 let DASHBOARD_PASS = process.env.DASHBOARD_PASS;
 if (!DASHBOARD_PASS) {
@@ -26,14 +26,42 @@ if (!DASHBOARD_PASS) {
   console.warn(`[Auth] DASHBOARD_PASS not set. Temporary password for this run: ${DASHBOARD_PASS}`);
 }
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
-const passOk = (given) => crypto.timingSafeEqual(sha(given), sha(DASHBOARD_PASS));
+const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
+const passOk = (given) => safeEqual(given, DASHBOARD_PASS);
 
-// Kick webhook: needs the RAW body for signature checking, so it must be
+// Simple brute-force limiter for the password-protected endpoints.
+const AUTH_MAX_FAILS = 10;
+const AUTH_WINDOW_MS = 10 * 60 * 1000;
+const authFails = new Map(); // ip -> { count, resetAt }
+
+function authBlocked(ip) {
+  const f = authFails.get(ip);
+  if (!f) return false;
+  if (Date.now() > f.resetAt) { authFails.delete(ip); return false; }
+  return f.count >= AUTH_MAX_FAILS;
+}
+function authFailed(ip) {
+  const f = authFails.get(ip);
+  if (!f || Date.now() > f.resetAt) authFails.set(ip, { count: 1, resetAt: Date.now() + AUTH_WINDOW_MS });
+  else f.count += 1;
+}
+
+// Small bounded "already seen" set used for de-duplicating chat messages.
+function makeSeen(limit) {
+  const set = new Set();
+  return (id) => {
+    if (set.has(id)) return true;
+    set.add(id);
+    if (set.size > limit) set.delete(set.values().next().value);
+    return false;
+  };
+}
+
+// Kick webhook needs the RAW body for signature checking, so it must be
 // registered before the JSON parser.
 app.post('/webhooks/kick', express.raw({ type: '*/*', limit: '200kb' }), (req, res) => handleKickWebhook(req, res));
 
 app.use(express.json({ limit: '10kb' }));
-// Serve the overlay at /overlay, /overlay/, /overlay.html and /overlay.html/ (trailing slash)
 app.get(['/overlay', '/overlay/', '/overlay.html', '/overlay.html/'], (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'overlay.html'));
 });
@@ -61,21 +89,29 @@ const activeAdapters = Object.fromEntries(PLATFORMS.map((p) => [p, blankAdapter(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+const escapeHtml = (v) =>
+  String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// Only allow http(s) avatars or local icons (blocks javascript:/data: URLs).
+function safeAvatar(url, platform) {
+  const fallback = `/icons/${platform}.svg`;
+  if (typeof url !== 'string' || !url) return fallback;
+  return /^https:\/\//i.test(url) || /^\/[\w./-]+$/.test(url) ? url : fallback;
+}
+
 function normalizeMessage(platform, username, message, avatar = '', id = null) {
-  const esc = (v) => String(v).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const p = platform.toLowerCase();
   return {
-    id: id || `${platform}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-    platform: platform.toLowerCase(),
-    username: esc(username || 'Anonymous'),
-    message: esc(message || ''),
-    avatar: avatar || `/icons/${platform.toLowerCase()}.svg`,
+    id: id || `${p}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+    platform: p,
+    username: escapeHtml(username || 'Anonymous'),
+    message: escapeHtml(message || ''),
+    avatar: safeAvatar(avatar, p),
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   };
 }
 
-function broadcastMessage(msg) {
-  io.emit('chatMessage', msg);
-}
+const broadcastMessage = (msg) => io.emit('chatMessage', msg);
 
 // For status "error" the message is also sent in `handle` so existing
 // dashboards that display `handle` keep working; `error` is the clean field.
@@ -84,12 +120,7 @@ function updatePlatformStatus(platform, status, handle = '', error = '') {
   a.status = status;
   if (handle) a.handle = handle;
   a.error = status === 'error' ? error || handle : '';
-  io.emit('statusUpdate', {
-    platform,
-    status,
-    handle: status === 'error' ? a.error : a.handle,
-    error: a.error
-  });
+  io.emit('statusUpdate', snapshot(platform));
 }
 
 function snapshot(platform) {
@@ -98,7 +129,7 @@ function snapshot(platform) {
 }
 
 // ---------------------------------------------------------------------------
-// Generic Python bridge runner (used by TikTok and Kick)
+// Generic Python bridge runner (used by TikTok)
 // Bridge protocol: one JSON object per stdout line:
 //   {type:'log'|'status'|'message'|'error', ...}
 // ---------------------------------------------------------------------------
@@ -112,7 +143,6 @@ function startBridge(platform, script, arg, attempt = 0) {
   updatePlatformStatus(platform, 'connecting', arg);
   console.log(`[${label}] Spawning Python bridge for "${arg}" (attempt ${attempt + 1})`);
 
-  // -u + PYTHONUNBUFFERED: piped Python stdout is block-buffered otherwise.
   const proc = spawn(PYTHON_BIN, ['-u', path.join(__dirname, 'python', script), arg], {
     env: { ...process.env, PYTHONUNBUFFERED: '1' },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -161,7 +191,7 @@ function startBridge(platform, script, arg, attempt = 0) {
   proc.stdout.on('data', (chunk) => {
     buffer += chunk.toString('utf8');
     const lines = buffer.split('\n');
-    buffer = lines.pop(); // keep the unfinished tail for the next chunk
+    buffer = lines.pop();
     lines.forEach(handleLine);
   });
 
@@ -175,11 +205,10 @@ function startBridge(platform, script, arg, attempt = 0) {
   proc.on('close', (code, signal) => {
     if (buffer.trim()) { handleLine(buffer); buffer = ''; }
     console.log(`[${label}] Bridge exited (code=${code}, signal=${signal})`);
-    if (!isCurrent()) return; // old process killed by reconnect/disconnect
+    if (!isCurrent()) return; // killed by reconnect/disconnect
 
     adapter.process = null;
-    const lastWasError = adapter.status === 'error';
-    if (!lastWasError) updatePlatformStatus(platform, 'disconnected');
+    if (adapter.status !== 'error') updatePlatformStatus(platform, 'disconnected');
 
     if (!fatal && attempt < BRIDGE_MAX_RETRIES) {
       const delay = Math.min(2000 * 2 ** attempt, 60000);
@@ -191,18 +220,22 @@ function startBridge(platform, script, arg, attempt = 0) {
 
 // ---------------------------------------------------------------------------
 // 1. YouTube: @handle, channel URL/ID, or video URL/ID.
-// For a handle/channel the server finds the channel's CURRENT live stream and
-// keeps checking every 30 s, so it connects by itself when you go live and
-// reconnects for the next stream.
+// Handle/channel: finds the channel's current live stream, re-checks every
+// 30 s, and reconnects by itself for the next stream. Errors are retried.
 // ---------------------------------------------------------------------------
 const YT_RETRY_MS = 30000;
+const YT_VIDEO_ID = /^[\w-]{11}$/;
 let ytClientPromise = null;
 
-// youtubei.js is ESM-only; require() of it fails on Node < 22.12, so import it.
-function getInnertube() {
+// youtubei.js is ESM-only, so it has to be imported dynamically.
+function getInnertube(fresh = false) {
+  if (fresh) ytClientPromise = null;
   if (!ytClientPromise) {
     ytClientPromise = import('youtubei.js')
-      .then((m) => m.Innertube.create())
+      .then((m) => {
+        try { m.Log?.setLevel(m.Log.Level.NONE); } catch {}
+        return m.Innertube.create({ retrieve_player: false });
+      })
       .catch((err) => { ytClientPromise = null; throw err; });
   }
   return ytClientPromise;
@@ -210,7 +243,6 @@ function getInnertube() {
 
 const codeErr = (code, message) => Object.assign(new Error(message), { code });
 
-// Turn whatever the user typed into an ordered list of things to try.
 function youTubeTargets(input) {
   const s = String(input || '').trim();
   const handle = (h) => ({ type: 'handle', value: h, label: `@${h}` });
@@ -224,11 +256,11 @@ function youTubeTargets(input) {
     const host = u.hostname.replace(/^(www\.|m\.)/, '');
     if (host === 'youtu.be') {
       const id = u.pathname.slice(1).split('/')[0];
-      return /^[\w-]{11}$/.test(id) ? [video(id)] : [];
+      return YT_VIDEO_ID.test(id) ? [video(id)] : [];
     }
     if (!host.endsWith('youtube.com')) return [];
     const v = u.searchParams.get('v');
-    if (v && /^[\w-]{11}$/.test(v)) return [video(v)];
+    if (v && YT_VIDEO_ID.test(v)) return [video(v)];
     let m = u.pathname.match(/^\/(?:live|embed|shorts)\/([\w-]{11})/);
     if (m) return [video(m[1])];
     m = u.pathname.match(/^\/@([\w.-]+)/);
@@ -240,34 +272,57 @@ function youTubeTargets(input) {
 
   if (s.startsWith('@')) return /^@[\w.-]{3,30}$/.test(s) ? [handle(s.slice(1))] : [];
   if (/^UC[\w-]{22}$/.test(s)) return [channel(s)];
-  if (/^[\w-]{11}$/.test(s)) {
-    // 11 characters can be a video ID or a short handle (e.g. "realmalkgpt").
-    // Real video IDs almost always contain an uppercase letter, "-" or "_".
+  if (YT_VIDEO_ID.test(s)) {
+    // 11 chars can be a video ID or a short handle. Real IDs usually contain A-Z, "-" or "_".
     return /[A-Z_-]/.test(s) ? [video(s), handle(s)] : [handle(s), video(s)];
   }
   if (/^[\w.-]{3,30}$/.test(s)) return [handle(s)];
   return [];
 }
 
+const ytFetchHtml = async (url) => {
+  const res = await fetch(url, {
+    headers: {
+      'Accept-Language': 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      Cookie: 'SOCS=CAI; CONSENT=YES+1'
+    },
+    signal: AbortSignal.timeout(10000)
+  });
+  return res.text();
+};
+
+async function channelIdFromHandle(yt, handle) {
+  try {
+    const ep = await yt.resolveURL(`https://www.youtube.com/@${handle}`);
+    const id = ep?.payload?.browseId;
+    if (id) return id;
+  } catch {}
+  try {
+    const html = await ytFetchHtml(`https://www.youtube.com/@${handle}`);
+    const m = html.match(/"(?:channelId|externalId|browseId)":"(UC[\w-]{22})"/);
+    if (m) return m[1];
+  } catch {}
+  return null;
+}
+
 function pickLiveVideoId(videos) {
   for (const v of videos || []) {
-    const live = v?.is_live === true || (v?.badges || []).some?.((b) => /LIVE_NOW/i.test(String(b?.style || '')));
-    const id = v?.video_id || v?.id;
-    if (live && /^[\w-]{11}$/.test(String(id))) return id;
+    const id = v?.video_id || v?.id || v?.content_id;
+    if (!YT_VIDEO_ID.test(String(id))) continue;
+    const badgeLive = (v?.badges || []).some?.((b) => /LIVE_NOW/i.test(String(b?.style || b?.label || '')));
+    if (v?.is_live === true || badgeLive) return id;
   }
   return null;
 }
 
-// Fallback: /live redirects to the current stream; its canonical link is the watch URL.
+// Fallback: <channel>/live redirects to the current stream when there is one.
 async function liveIdFromLivePage(pathPart) {
   try {
-    const res = await fetch(`https://www.youtube.com/${pathPart}/live`, {
-      headers: { 'Accept-Language': 'en-US,en;q=0.9', Cookie: 'SOCS=CAI; CONSENT=YES+1' },
-      signal: AbortSignal.timeout(10000)
-    });
-    const html = await res.text();
+    const html = await ytFetchHtml(`https://www.youtube.com/${pathPart}/live`);
     const m = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
-    return m ? m[1] : null;
+    if (!m) return null;
+    return /"isLiveNow":true|"isLive":true/.test(html) ? m[1] : null;
   } catch {
     return null;
   }
@@ -276,10 +331,7 @@ async function liveIdFromLivePage(pathPart) {
 async function findLiveVideoId(yt, t) {
   let channelId = t.value;
   if (t.type === 'handle') {
-    try {
-      const ep = await yt.resolveURL(`https://www.youtube.com/@${t.value}`);
-      channelId = ep?.payload?.browseId;
-    } catch { channelId = null; }
+    channelId = await channelIdFromHandle(yt, t.value);
     if (!channelId) throw codeErr('NOT_FOUND', `YouTube channel @${t.value} not found`);
   }
 
@@ -296,6 +348,24 @@ async function findLiveVideoId(yt, t) {
   return id;
 }
 
+function ytItemToMessage(item, isSeen) {
+  if (!item || !['LiveChatTextMessage', 'LiveChatPaidMessage'].includes(item.type)) return null;
+
+  const id = item.id ? `youtube-${item.id}` : null;
+  if (id && isSeen(id)) return null;
+
+  let text = item.message?.toString?.() || '';
+  if (item.type === 'LiveChatPaidMessage') {
+    const amount = item.purchase_amount ? `${item.purchase_amount} ` : '';
+    text = `\u{1F4B0} ${amount}${text}`.trim();
+  }
+  if (!text) return null;
+
+  const author = item.author?.name?.toString?.() || 'Viewer';
+  const avatar = item.author?.thumbnails?.[0]?.url || '';
+  return normalizeMessage('youtube', author, text, avatar, id);
+}
+
 async function connectYouTube(input) {
   disconnectPlatform('youtube');
   const targets = youTubeTargets(input);
@@ -309,14 +379,20 @@ async function connectYouTube(input) {
 }
 
 async function runYouTube(targets, token, label) {
-  const current = () => activeAdapters.youtube.token === token;
+  const adapter = () => activeAdapters.youtube;
+  const current = () => adapter().token === token;
   const watching = targets.some((t) => t.type !== 'video'); // handle/channel: keep waiting for a live stream
-  const fail = (msg) => { console.error(`[YouTube] ${msg}`); if (current()) updatePlatformStatus('youtube', 'error', label, msg); };
+
+  const fail = (msg) => {
+    console.error(`[YouTube] ${msg}`);
+    if (current()) updatePlatformStatus('youtube', 'error', label, msg);
+  };
   const retryLater = (why) => {
     if (!current()) return;
     console.log(`[YouTube] ${why}. Checking again in ${YT_RETRY_MS / 1000}s`);
     updatePlatformStatus('youtube', 'connecting', label);
-    activeAdapters.youtube.retry = setTimeout(() => runYouTube(targets, token, label), YT_RETRY_MS);
+    clearTimeout(adapter().retry);
+    adapter().retry = setTimeout(() => runYouTube(targets, token, label), YT_RETRY_MS);
   };
 
   let liveChat = null;
@@ -338,8 +414,8 @@ async function runYouTube(targets, token, label) {
     }
     if (!current()) return;
     if (!videoId) {
-      if (notLive) return retryLater(lastErr?.message || 'Not live');
-      return fail(lastErr?.message || 'YouTube channel or video not found');
+      if (notLive || watching) return retryLater(lastErr?.message || 'Not live');
+      return fail(lastErr?.message || 'YouTube video not found');
     }
 
     const info = await yt.getInfo(videoId);
@@ -349,53 +425,48 @@ async function runYouTube(targets, token, label) {
     }
 
     liveChat = info.getLiveChat();
-    const seen = new Set();
+    const isSeen = makeSeen(1000);
+    let finished = false;
+
+    // Single exit path: runs once even if both 'error' and 'end' fire.
+    const finish = (why, err) => {
+      if (finished || !current()) return;
+      finished = true;
+      try { liveChat.stop(); } catch {}
+      adapter().instance = null;
+      if (watching) {
+        ytClientPromise = null; // fresh session next time
+        return retryLater(why);
+      }
+      if (err) return fail(String(err?.message || err));
+      updatePlatformStatus('youtube', 'disconnected');
+    };
 
     liveChat.on('chat-update', (action) => {
       if (!current() || action?.type !== 'AddChatItemAction') return;
-      const item = action.item;
-      if (!item || !['LiveChatTextMessage', 'LiveChatPaidMessage'].includes(item.type)) return;
-
-      const id = item.id ? `youtube-${item.id}` : null;
-      if (id) {
-        if (seen.has(id)) return;
-        seen.add(id);
-        if (seen.size > 1000) seen.delete(seen.values().next().value);
+      try {
+        const msg = ytItemToMessage(action.item, isSeen);
+        if (msg) broadcastMessage(msg);
+      } catch (e) {
+        console.error('[YouTube] Message handling failed:', e?.message || e);
       }
-      let text = item.message?.toString?.() || '';
-      if (item.type === 'LiveChatPaidMessage') {
-        const amount = item.purchase_amount ? `${item.purchase_amount} ` : '';
-        text = `\u{1F4B0} ${amount}${text}`.trim();
-      }
-      if (!text) return;
-      const author = item.author?.name;
-      broadcastMessage(normalizeMessage('youtube', author?.toString?.() || 'Viewer', text, item.author?.thumbnails?.[0]?.url || '', id));
     });
-
-    const restartOrStop = (why) => {
-      if (!current()) return;
-      try { liveChat.stop(); } catch {}
-      activeAdapters.youtube.instance = null;
-      if (watching) retryLater(why);
-      else updatePlatformStatus('youtube', 'disconnected');
-    };
     liveChat.on('error', (err) => {
       console.error('[YouTube] Live chat error:', err?.message || err);
-      if (watching) restartOrStop('Chat error');
-      else fail(String(err?.message || err));
+      finish('Chat error', err);
     });
-    liveChat.on('end', () => restartOrStop('Stream ended'));
+    liveChat.on('end', () => finish('Stream ended'));
 
     liveChat.start();
-    activeAdapters.youtube.instance = liveChat;
+    adapter().instance = liveChat;
     console.log(`[YouTube] Connected to live chat of video ${videoId}`);
     updatePlatformStatus('youtube', 'connected', label);
   } catch (err) {
     try { liveChat?.stop(); } catch {}
     const msg = String(err?.message || err);
     console.error('[YouTube] Connect failed:', msg);
-    // "Live Chat is not available" = no live chat on this video yet / chat disabled / not live.
-    if (watching && /live chat|not live|unavailable/i.test(msg)) return retryLater('No live chat yet');
+    ytClientPromise = null; // rebuild the session on the next attempt
+    if (watching) return retryLater(msg);
     fail(msg);
   }
 }
@@ -446,9 +517,7 @@ async function connectTwitch(channel) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Kick: official API + webhooks (the unofficial websocket is blocked by
-// Cloudflare from servers, so the old Python bridge could not connect).
-//
+// 4. Kick: official API + webhooks.
 // Setup: https://kick.com/settings/developer -> create an app, then set
 //   env KICK_CLIENT_ID, KICK_CLIENT_SECRET
 //   Webhook URL in the Kick app settings: https://YOUR-HOST/webhooks/kick
@@ -458,7 +527,7 @@ const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET;
 const KICK_API = 'https://api.kick.com/public/v1';
 let kickToken = { value: null, exp: 0 };
 let kickPublicKeyPem = null;
-const kickSeen = new Set();
+const kickSeen = makeSeen(1000);
 
 async function kickAppToken(force = false) {
   if (!force && kickToken.value && Date.now() < kickToken.exp - 60000) return kickToken.value;
@@ -469,7 +538,8 @@ async function kickAppToken(force = false) {
       grant_type: 'client_credentials',
       client_id: KICK_CLIENT_ID,
       client_secret: KICK_CLIENT_SECRET
-    })
+    }),
+    signal: AbortSignal.timeout(10000)
   });
   const j = await res.json().catch(() => ({}));
   if (!res.ok || !j.access_token) {
@@ -488,7 +558,8 @@ async function kickApi(method, pathAndQuery, body, retried = false) {
       Accept: 'application/json',
       ...(body ? { 'Content-Type': 'application/json' } : {})
     },
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(10000)
   });
   if (res.status === 401 && !retried) return kickApi(method, pathAndQuery, body, true);
   const j = await res.json().catch(() => ({}));
@@ -557,8 +628,7 @@ function kickSignatureValid(headers, rawBody, pem) {
   if (!id || !ts || !sig) return false;
   const key = crypto.createPublicKey(pem);
   const data = Buffer.from(`${id}.${ts}.${rawBody.toString('utf8')}`);
-  // Handles both RSA (SHA-256) and Ed25519 keys.
-  const algo = key.asymmetricKeyType === 'ed25519' ? null : 'RSA-SHA256';
+  const algo = key.asymmetricKeyType === 'ed25519' ? null : 'RSA-SHA256'; // RSA or Ed25519
   return crypto.verify(algo, data, key, Buffer.from(sig, 'base64'));
 }
 
@@ -579,12 +649,8 @@ async function handleKickWebhook(req, res) {
 
     res.status(200).end(); // answer fast: Kick unsubscribes after failed deliveries
 
-    const eventType = req.headers['kick-event-type'];
-    const msgId = req.headers['kick-event-message-id'];
-    if (eventType !== 'chat.message.sent') return;
-    if (kickSeen.has(msgId)) return;
-    kickSeen.add(msgId);
-    if (kickSeen.size > 1000) kickSeen.delete(kickSeen.values().next().value);
+    if (req.headers['kick-event-type'] !== 'chat.message.sent') return;
+    if (kickSeen(req.headers['kick-event-message-id'])) return;
 
     const p = JSON.parse(raw.toString('utf8'));
     const active = activeAdapters.kick.instance;
@@ -600,12 +666,12 @@ async function handleKickWebhook(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Rumble: official Live Stream API (polled). Works for YOUR OWN channel only
-// and only while you are live. Get the URL at rumble.com/account/livestream-api
-// (it contains your secret key). Paste the full URL (or just the key) into the
-// dashboard, or put it in env RUMBLE_API_URL and type "env" as the handle.
-// The URL/key is never stored in the status `handle`, so it is not broadcast
-// to overlay viewers or shown by /api/status.
+// 5. Rumble: official Live Stream API (polled). Works for YOUR OWN channel
+// only and only while you are live. Get the URL at
+// rumble.com/account/livestream-api (it contains your secret key). Paste the
+// full URL (or just the key) into the dashboard, or put it in env
+// RUMBLE_API_URL and type "env" as the handle. The URL/key is never stored in
+// the status `handle`, so it is not broadcast to overlay viewers.
 // ---------------------------------------------------------------------------
 const RUMBLE_POLL_MS = 4000;
 
@@ -641,7 +707,7 @@ async function connectRumble(input) {
   activeAdapters.rumble.token = token;
   updatePlatformStatus('rumble', 'connecting', 'Rumble');
 
-  const seen = new Set();
+  const isSeen = makeSeen(2000);
   let firstPoll = true;
   let failures = 0;
   let wasLive = null;
@@ -681,9 +747,7 @@ async function connectRumble(input) {
 
       for (const m of items) {
         const id = `rumble-${m._rant ? 'rant-' : ''}${m.id ?? `${m.username}-${m.created_on}-${m.text}`}`;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        if (seen.size > 2000) seen.delete(seen.values().next().value);
+        if (isSeen(id)) continue;
         if (firstPoll) continue; // existing backlog: remember it, do not replay it
         if (!m.text && !m._rant) continue;
 
@@ -708,8 +772,7 @@ async function connectRumble(input) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Facebook: not implemented. The old version showed a fake
-// "connected" status every 5 s, which was misleading, so they now report it.
+// 6. Facebook: not implemented. Reports that honestly instead of faking it.
 // ---------------------------------------------------------------------------
 function connectUnsupported(platform, handle) {
   disconnectPlatform(platform);
@@ -724,10 +787,10 @@ function disconnectPlatform(platform, { silent = false } = {}) {
   if (!a) return;
 
   clearTimeout(a.retry);
-  clearInterval(a.timer);
+  clearTimeout(a.timer);
   try { a.instance?.stop?.(); } catch {}
   try { a.process?.kill('SIGTERM'); } catch {}
-  try { a.client?.disconnect?.().catch?.(() => {}); } catch {}
+  try { a.client?.disconnect?.()?.catch?.(() => {}); } catch {}
 
   activeAdapters[platform] = blankAdapter();
   if (!silent) updatePlatformStatus(platform, 'disconnected');
@@ -737,8 +800,13 @@ function disconnectPlatform(platform, { silent = false } = {}) {
 // API
 // ---------------------------------------------------------------------------
 function requireAuth(req, res, next) {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  if (authBlocked(ip)) return res.status(429).json({ error: 'Too many failed attempts. Try again later.' });
   const given = req.body?.auth;
-  if (typeof given !== 'string' || !passOk(given)) return res.status(401).json({ error: 'Unauthorized' });
+  if (typeof given !== 'string' || !passOk(given)) {
+    authFailed(ip);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   next();
 }
 
@@ -781,11 +849,12 @@ app.get('/api/status', (_req, res) => {
 app.get('/health', (_req, res) => res.status(200).send('OK'));
 
 // ---------------------------------------------------------------------------
-// Overlay URL config: /overlay.html?twitch=NAME&kick=NAME&youtube=@HANDLE&tiktok=NAME&rumble=URL
+// Overlay URL config:
+//   /overlay.html?twitch=NAME&kick=NAME&youtube=@HANDLE&tiktok=NAME&rumble=URL
 // The overlay page sends these over the socket and the server connects them.
-// Reloading the overlay never restarts a platform that is already running for the
-// same value, and changes are rate-limited because this endpoint has no password.
-// Optional: set env OVERLAY_KEY and add &key=THAT_VALUE to the URL to require it.
+// Reloading the overlay never restarts a platform already running for the same
+// value, and changes are rate-limited because this endpoint has no password.
+// Optional: set env OVERLAY_KEY and add &key=THAT_VALUE to require it.
 // ---------------------------------------------------------------------------
 const OVERLAY_PLATFORMS = ['twitch', 'kick', 'youtube', 'tiktok', 'rumble'];
 const OVERLAY_COOLDOWN_MS = 15000;
@@ -795,7 +864,7 @@ function applyOverlayConfig(cfg) {
   if (!cfg || typeof cfg !== 'object') return;
   if (process.env.OVERLAY_KEY) {
     const given = typeof cfg.key === 'string' ? cfg.key : '';
-    if (!crypto.timingSafeEqual(sha(given), sha(process.env.OVERLAY_KEY))) return;
+    if (!safeEqual(given, process.env.OVERLAY_KEY)) return;
   }
   for (const p of OVERLAY_PLATFORMS) {
     const raw = cfg[p];
