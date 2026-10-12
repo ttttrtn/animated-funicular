@@ -1,4 +1,5 @@
 import sys
+import re
 import json
 import time
 import uuid
@@ -16,6 +17,7 @@ username = sys.argv[1].replace("@", "").strip()
 OFFLINE_RETRY_S = 30      # streamer not live yet: check again every 30s
 ERROR_RETRY_MIN_S = 5
 ERROR_RETRY_MAX_S = 120
+BADGE_DEBUG_LIMIT = 3     # log the raw badge scene names for the first few chat events
 
 
 def emit(obj):
@@ -49,6 +51,97 @@ def display_name(user):
     return (getattr(user, "nickname", "") or getattr(user, "unique_id", "") or "TikTok user")
 
 
+# ---------------------------------------------------------------------------
+# Badges. Every access is defensive: TikTokLive's protobuf classes change
+# between versions, and a missing attribute must never kill a chat event.
+# ---------------------------------------------------------------------------
+_badge_debug_left = BADGE_DEBUG_LIMIT
+
+
+def _scene_name(scene):
+    """Badge scene as a lowercase string (enum name if available)."""
+    if scene is None:
+        return ""
+    name = getattr(scene, "name", None)
+    return str(name if name else scene).lower()
+
+
+def _first_url(img):
+    urls = getattr(img, "url_list", None) if img else None
+    if urls:
+        url = str(urls[0])
+        return url if url.startswith("https://") else ""
+    return ""
+
+
+def badges_of(user):
+    global _badge_debug_left
+    out, seen = [], set()
+
+    def add(kind, label="", url=""):
+        key = (kind, url)
+        if key in seen or len(out) >= 6:
+            return
+        seen.add(key)
+        out.append({"type": kind, "label": label or kind, "url": url})
+
+    if (getattr(user, "unique_id", "") or "").lower() == username.lower():
+        add("broadcaster", "Streamer")
+    if getattr(user, "is_moderator", False) is True:
+        add("moderator", "Moderator")
+    if getattr(user, "is_subscriber", False) is True:
+        add("subscriber", "Subscriber")
+
+    raw = []
+    for attr in ("badges", "badge_list"):
+        value = getattr(user, attr, None)
+        if value and not callable(value):
+            try:
+                raw.extend(list(value))
+            except Exception:
+                pass
+
+    scenes = []
+    for b in raw:
+        try:
+            scene = _scene_name(getattr(b, "badge_scene_type", None))
+            scenes.append(scene)
+            if "admin" in scene or "moderator" in scene:
+                kind = "moderator"
+            elif "subscriber" in scene:
+                kind = "subscriber"
+            else:
+                kind = re.sub(r"[^a-z0-9_-]", "", scene.replace(" ", "_")) or "badge"
+            image = getattr(getattr(b, "image_badge", None), "image", None)
+            text = getattr(getattr(b, "text_badge", None), "default_pattern", "") or ""
+            add(kind, str(text) or kind, _first_url(image))
+        except Exception:
+            continue
+
+    if _badge_debug_left > 0:
+        _badge_debug_left -= 1
+        log(f"badge debug for @{getattr(user, 'unique_id', '?')}: scenes={scenes} -> {[b['type'] for b in out]}")
+    return out
+
+
+def gift_in_progress(event):
+    """True while a gift streak is still running (only the final event should be shown).
+
+    Newer TikTokLive versions can hand us a gift object without `streakable`,
+    and `event.streaking` reads that same attribute, so neither is trusted.
+    """
+    gift = getattr(event, "gift", None)
+    streakable = getattr(gift, "streakable", None)
+    if streakable is None:
+        gift_type = getattr(gift, "type", None)
+        if gift_type is None:
+            gift_type = getattr(gift, "gift_type", None)
+        if gift_type is None:
+            return False  # unknown: show every event rather than hide gifts
+        streakable = gift_type == 1
+    return bool(streakable) and not bool(getattr(event, "repeat_end", 0))
+
+
 def build_client():
     client = TikTokLiveClient(unique_id=username)
 
@@ -72,27 +165,32 @@ def build_client():
             "handle": getattr(event.user, "unique_id", ""),
             "message": text,
             "avatar": avatar_of(event.user),
+            "badges": badges_of(event.user),
             "id": message_id(event),
             "timestamp": int(time.time() * 1000),
         })
 
     @client.on(GiftEvent)
     async def on_gift(event: GiftEvent):
-        # Streakable gifts fire repeatedly while the streak is running; only
-        # report the final one.
-        if event.gift.streakable and event.streaking:
-            return
-        count = event.repeat_count or 1
-        emit({
-            "type": "message",
-            "platform": "tiktok",
-            "username": display_name(event.user),
-            "handle": getattr(event.user, "unique_id", ""),
-            "message": f"sent {count}x {event.gift.name} \U0001F381",
-            "avatar": avatar_of(event.user),
-            "id": message_id(event),
-            "timestamp": int(time.time() * 1000),
-        })
+        try:
+            if gift_in_progress(event):
+                return
+            gift = getattr(event, "gift", None)
+            name = getattr(gift, "name", "") or "a gift"
+            count = getattr(event, "repeat_count", 1) or 1
+            emit({
+                "type": "message",
+                "platform": "tiktok",
+                "username": display_name(event.user),
+                "handle": getattr(event.user, "unique_id", ""),
+                "message": f"sent {count}x {name} \U0001F381",
+                "avatar": avatar_of(event.user),
+                "badges": badges_of(event.user),
+                "id": message_id(event),
+                "timestamp": int(time.time() * 1000),
+            })
+        except Exception as e:
+            log(f"Gift event skipped: {type(e).__name__}: {e}")
 
     return client
 
@@ -104,8 +202,7 @@ async def main():
         try:
             status("connecting")
             # start() is NON-blocking: it returns the connection task as soon as
-            # the socket is up. The old script returned right here, so the
-            # process exited a moment after "connected". Await the task instead.
+            # the socket is up. Await the task so the process stays alive.
             task = await client.start()
             delay = ERROR_RETRY_MIN_S
             await task
