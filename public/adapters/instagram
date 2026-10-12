@@ -1,0 +1,372 @@
+'use strict';
+// Instagram Live chat.
+//
+// Mode 1 (default): LOGIN WINDOW. A real Chrome/Edge window pops out on the
+//   computer running this server. You log in to Instagram once (the session is
+//   kept in data/instagram-profile), then the server opens the broadcaster's
+//   live page and polls the same web endpoints the Social Stream content script
+//   uses:  GET /api/v1/live/{broadcast_id}/get_comment/?last_comment_ts=...
+//   It works for ANY public live you can watch. It is unofficial: it drives the
+//   website with your own session, which Instagram's terms do not allow, so use
+//   a spare account if you care about the account.
+//   Needs:  npm i puppeteer-core   and Chrome or Edge installed (or CHROME_PATH).
+//   Handle: the broadcaster's @username (or instagram.com/<user>/live URL).
+//
+// Mode 2: OFFICIAL API, for YOUR OWN lives only (professional account).
+//   GET /{ig-user-id}/live_media  then  GET /{live-media-id}/comments
+//   Needs INSTAGRAM_ACCESS_TOKEN (and optionally INSTAGRAM_USER_ID, default "me").
+//   Handle: "official".
+//
+// Headless servers (no display): set INSTAGRAM_SESSIONID (+ INSTAGRAM_DS_USER_ID,
+// INSTAGRAM_CSRFTOKEN) from a logged-in browser and the window is skipped.
+const fs = require('fs');
+const path = require('path');
+
+const IG = 'https://www.instagram.com';
+const PROFILE_DIR = process.env.INSTAGRAM_PROFILE_DIR || path.join(__dirname, '..', 'data', 'instagram-profile');
+const LOGIN_TIMEOUT_MS = Number(process.env.INSTAGRAM_LOGIN_TIMEOUT_MS) || 5 * 60 * 1000;
+const POLL_MS = 2000;
+const RETRY_MS = 30000;
+const MAX_POLL_FAILS = 4;
+const OFFICIAL_GRAPH = 'https://graph.instagram.com';
+
+function findChrome() {
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
+  const list = {
+    win32: [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
+    ],
+    darwin: [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+    ],
+    linux: ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/microsoft-edge']
+  }[process.platform] || [];
+  return list.find((p) => fs.existsSync(p)) || null;
+}
+
+async function defaultLaunch({ headless }) {
+  let puppeteer;
+  try { puppeteer = require('puppeteer-core'); } catch { throw new Error('Run "npm i puppeteer-core" to enable Instagram'); }
+  const executablePath = findChrome();
+  if (!executablePath) throw new Error('Chrome or Edge not found. Install one or set CHROME_PATH');
+  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  const browser = await puppeteer.launch({
+    executablePath,
+    headless,
+    userDataDir: PROFILE_DIR,
+    defaultViewport: null,
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: ['--window-size=480,860', '--window-position=60,40', '--mute-audio', '--no-first-run',
+      ...(headless && process.platform === 'linux' ? ['--no-sandbox'] : [])]
+  });
+  const page = (await browser.pages())[0] || (await browser.newPage());
+  return { browser, page };
+}
+
+async function hasSession(page) {
+  const cookies = await page.cookies(IG);
+  return cookies.some((c) => c.name === 'sessionid' && c.value);
+}
+
+async function injectEnvSession(page) {
+  const sid = process.env.INSTAGRAM_SESSIONID;
+  if (!sid) return false;
+  const base = { domain: '.instagram.com', path: '/', secure: true };
+  const cookies = [{ ...base, name: 'sessionid', value: sid, httpOnly: true }];
+  if (process.env.INSTAGRAM_DS_USER_ID) cookies.push({ ...base, name: 'ds_user_id', value: process.env.INSTAGRAM_DS_USER_ID });
+  if (process.env.INSTAGRAM_CSRFTOKEN) cookies.push({ ...base, name: 'csrftoken', value: process.env.INSTAGRAM_CSRFTOKEN });
+  await page.setCookie(...cookies);
+  return true;
+}
+
+async function minimizeWindow(page) {
+  try {
+    const s = await page.createCDPSession();
+    const { windowId } = await s.send('Browser.getWindowForTarget');
+    await s.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+  } catch {}
+}
+
+// Runs inside the Instagram page. Mirrors the Social Stream content script.
+function pageFindBroadcastId() {
+  const m = (location.search || '').match(/[?&]broadcast_id=(\d+)/);
+  if (m) return m[1];
+  for (const s of document.querySelectorAll('script')) {
+    const t = s.textContent || '';
+    if (t.length > 2000000) continue;
+    const b = t.match(/"broadcast_id"\s*:\s*"?(\d{10,})"?/);
+    if (b) return b[1];
+  }
+  return null;
+}
+
+async function pageFetchComments(broadcastId, sinceTs) {
+  const csrf = ((document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/) || [])[1]) || '';
+  const url = `/api/v1/live/${broadcastId}/get_comment/${sinceTs ? `?last_comment_ts=${sinceTs}` : ''}`;
+  const r = await fetch(url, {
+    credentials: 'same-origin',
+    headers: {
+      'X-IG-App-ID': '936619743392459',
+      'X-CSRFToken': decodeURIComponent(csrf),
+      'X-ASBD-ID': '359341',
+      'X-Requested-With': 'XMLHttpRequest'
+    }
+  });
+  if (!r.ok) return { ok: false, status: r.status };
+  return { ok: true, json: await r.json() };
+}
+
+function parseTarget(input) {
+  const s = String(input || '').trim();
+  if (/^official$/i.test(s)) return { mode: 'official' };
+  let name = s.replace(/^@/, '');
+  try {
+    const u = new URL(/^https?:/i.test(s) ? s : `https://${s}`);
+    if (/instagram\.com$/i.test(u.hostname)) name = u.pathname.split('/').filter(Boolean)[0] || '';
+  } catch {}
+  return /^[A-Za-z0-9._]{1,30}$/.test(name) ? { mode: 'browser', user: name } : null;
+}
+
+function init(ctx, opts = {}) {
+  const { activeAdapters, updatePlatformStatus, normalizeMessage, broadcastMessage, makeSeen, disconnectPlatform } = ctx;
+  const launch = opts.launch || defaultLaunch;
+  const pollMs = opts.pollMs || POLL_MS;
+  const retryMs = opts.retryMs || RETRY_MS;
+  const settleMs = opts.settleMs ?? 4000;     // wait after loading the live page
+  const loginPollMs = opts.loginPollMs ?? 2000;
+  let shared = null; // { browser, page }
+
+  async function ensureBrowser() {
+    if (shared) return shared;
+    const headless = Boolean(process.env.INSTAGRAM_SESSIONID);
+    const s = await launch({ headless });
+    shared = s;
+    try { s.browser.on?.('disconnected', () => { if (shared === s) shared = null; }); } catch {}
+    return s;
+  }
+  async function closeBrowser() {
+    const s = shared;
+    shared = null;
+    try { await s?.browser?.close(); } catch {}
+  }
+
+  // Pops the login window (used by the dashboard button and by connect).
+  async function openLogin() {
+    const { page } = await ensureBrowser();
+    if (await injectEnvSession(page)) return true;
+    if (await hasSession(page)) return true;
+    await page.goto(`${IG}/accounts/login/`, { waitUntil: 'domcontentloaded' });
+    return false;
+  }
+
+  function toMessage(c) {
+    const verified = Boolean(c.user?.is_verified);
+    return normalizeMessage(
+      'instagram',
+      c.user?.username || 'Instagram user',
+      c.text || '',
+      c.user?.profile_pic_url || '',
+      `instagram-${c.pk || c.strong_id__ || `${c.user?.username}-${c.created_at}`}`,
+      verified ? [{ type: 'verified', label: 'Verified', url: '/icons/instagram/verified.svg' }] : []
+    );
+  }
+
+  async function connectInstagram(input) {
+    disconnectPlatform('instagram');
+    const target = parseTarget(input);
+    const label = String(input || '').slice(0, 60);
+    if (!target) {
+      return updatePlatformStatus('instagram', 'error', label, 'Use the broadcaster @username, an instagram.com/<user>/live URL, or "official"');
+    }
+    if (target.mode === 'official' && !process.env.INSTAGRAM_ACCESS_TOKEN) {
+      return updatePlatformStatus('instagram', 'error', 'official', 'Set INSTAGRAM_ACCESS_TOKEN (Instagram API with Instagram Login) in the server environment');
+    }
+    const symbol = Symbol('instagram');
+    activeAdapters.instagram.token = symbol;
+    updatePlatformStatus('instagram', 'connecting', target.user ? `@${target.user}` : 'official');
+    if (target.mode === 'official') runOfficial(symbol);
+    else runBrowser(target.user, symbol);
+  }
+
+  // ---------------- Mode 1: login window + page polling ----------------
+  function runBrowser(user, symbol) {
+    const current = () => activeAdapters.instagram.token === symbol;
+    const label = `@${user}`;
+    const isSeen = makeSeen(500);
+    let stopped = false;
+    let timer = null;
+    let lastTs = 0;
+    let broadcastId = null;
+    let fails = 0;
+
+    const stop = () => {
+      stopped = true;
+      clearTimeout(timer);
+      closeBrowser();
+    };
+    activeAdapters.instagram.instance = { stop };
+    const alive = () => !stopped && current();
+    const fail = (msg) => { if (current()) updatePlatformStatus('instagram', 'error', label, msg); stop(); };
+    const later = (ms, fn) => { timer = setTimeout(fn, ms); };
+
+    const waitForLogin = async (page) => {
+      const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+      updatePlatformStatus('instagram', 'connecting', `${label} (log in to Instagram in the window that opened)`);
+      while (alive() && Date.now() < deadline) {
+        if (await hasSession(page)) return true;
+        await new Promise((r) => setTimeout(r, loginPollMs));
+      }
+      return false;
+    };
+
+    const findLive = async (page) => {
+      await page.goto(`${IG}/${encodeURIComponent(user)}/live/`, { waitUntil: 'domcontentloaded' });
+      await new Promise((r) => setTimeout(r, settleMs));
+      return page.evaluate(pageFindBroadcastId);
+    };
+
+    const poll = async (page) => {
+      if (!alive()) return;
+      try {
+        const r = await page.evaluate(pageFetchComments, broadcastId, lastTs);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const json = r.json || {};
+        if (json.status && json.status !== 'ok') throw new Error(`status ${json.status}`);
+        fails = 0;
+        const list = (Array.isArray(json.comments) ? json.comments : [])
+          .slice().sort((a, b) => (a?.created_at || 0) - (b?.created_at || 0));
+        for (const c of list) {
+          if (!c?.user?.username || !c.text) continue;
+          if (c.created_at > lastTs) lastTs = c.created_at;
+          const m = toMessage(c);
+          if (!isSeen(m.id)) broadcastMessage(m);
+        }
+      } catch (err) {
+        fails += 1;
+        console.error(`[Instagram] Poll failed (${fails}):`, err?.message || err);
+        if (fails >= MAX_POLL_FAILS) {
+          broadcastId = null; // stream probably ended: look for a new one
+          updatePlatformStatus('instagram', 'connecting', `${label} (waiting for the live to start)`);
+          return later(retryMs, () => session(page));
+        }
+      }
+      if (alive()) later(pollMs, () => poll(page));
+    };
+
+    const session = async (page) => {
+      if (!alive()) return;
+      try {
+        broadcastId = await findLive(page);
+        if (!alive()) return;
+        if (!broadcastId) {
+          console.log(`[Instagram] ${label} is not live. Checking again in ${Math.round(retryMs / 1000)}s`);
+          updatePlatformStatus('instagram', 'connecting', `${label} (not live right now)`);
+          return later(retryMs, () => session(page));
+        }
+        lastTs = Math.floor(Date.now() / 1000); // do not replay the backlog
+        fails = 0;
+        console.log(`[Instagram] Connected to live ${broadcastId} of ${label}`);
+        updatePlatformStatus('instagram', 'connected', label);
+        poll(page);
+      } catch (err) {
+        console.error('[Instagram] Lookup failed:', err?.message || err);
+        if (alive()) later(retryMs, () => session(page));
+      }
+    };
+
+    (async () => {
+      try {
+        const { page } = await ensureBrowser();
+        if (!alive()) return;
+        const ready = await openLogin();
+        if (!ready) {
+          if (!(await waitForLogin(page))) return fail('Instagram login timed out. Click connect again and log in within a few minutes');
+        }
+        if (!alive()) return;
+        await minimizeWindow(page);
+        session(page);
+      } catch (err) {
+        fail(String(err?.message || err));
+      }
+    })();
+  }
+
+  // ---------------- Mode 2: official API (own live) ----------------
+  function runOfficial(symbol) {
+    const current = () => activeAdapters.instagram.token === symbol;
+    const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+    const igUser = process.env.INSTAGRAM_USER_ID || 'me';
+    const base = opts.officialBase || OFFICIAL_GRAPH;
+    const isSeen = makeSeen(1000);
+    let stopped = false;
+    let timer = null;
+    let liveId = null;
+    let wasLive = null;
+    let fails = 0;
+    const startedAt = Date.now();
+
+    const stop = () => { stopped = true; clearTimeout(timer); };
+    activeAdapters.instagram.instance = { stop };
+    const alive = () => !stopped && current();
+
+    const get = async (p) => {
+      const sep = p.includes('?') ? '&' : '?';
+      const r = await fetch(`${base}${p}${sep}access_token=${encodeURIComponent(token)}`, { signal: AbortSignal.timeout(12000) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.error) {
+        const e = new Error(j.error?.message || `HTTP ${r.status}`);
+        e.code = j.error?.code;
+        e.fatal = [190, 10, 200].includes(j.error?.code) || r.status === 401 || r.status === 403;
+        throw e;
+      }
+      return j;
+    };
+
+    const tick = async () => {
+      if (!alive()) return;
+      try {
+        if (!liveId) {
+          const j = await get(`/${encodeURIComponent(igUser)}/live_media?fields=id`);
+          liveId = j.data?.[0]?.id || null;
+        }
+        const live = Boolean(liveId);
+        if (live !== wasLive) {
+          console.log(`[Instagram] ${live ? `Live ${liveId} found` : 'No live right now'} (official API)`);
+          wasLive = live;
+          updatePlatformStatus('instagram', live ? 'connected' : 'connecting', live ? 'official' : 'official (not live right now)');
+        }
+        if (liveId) {
+          const j = await get(`/${liveId}/comments?fields=id,text,username,timestamp`);
+          fails = 0;
+          for (const c of (j.data || []).slice().reverse()) {
+            if (!c.text || !c.id) continue;
+            const t = Date.parse(c.timestamp || '');
+            if (Number.isFinite(t) && t < startedAt - 5000) continue; // before we joined
+            const id = `instagram-${c.id}`;
+            if (isSeen(id)) continue;
+            broadcastMessage(normalizeMessage('instagram', c.username || 'Instagram user', c.text, '', id, []));
+          }
+        }
+      } catch (err) {
+        fails += 1;
+        console.error(`[Instagram] Official API error (${fails}):`, err?.message || err);
+        if (err.fatal) {
+          updatePlatformStatus('instagram', 'error', 'official', `${err.message} (check INSTAGRAM_ACCESS_TOKEN)`);
+          return stop();
+        }
+        liveId = null; // the live probably ended; look again
+        wasLive = null;
+      }
+      if (alive()) timer = setTimeout(tick, liveId ? 3000 : 15000);
+    };
+    tick();
+  }
+
+  return { connectInstagram, openLogin };
+}
+
+module.exports = { init, parseTarget, findChrome };
