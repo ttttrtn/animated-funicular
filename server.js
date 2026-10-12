@@ -729,31 +729,112 @@ function connectTikTok(username) {
 
 // ---------------------------------------------------------------------------
 // 3. Twitch
+//
+// Badge images: the old https://badges.twitch.tv endpoint was permanently shut
+// down (June 2023). Badge images now come from Helix (Get Global / Channel Chat
+// Badges), which needs an app access token:
+//     env TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET   (dev.twitch.tv/console)
+// Without those, the community IVR API (api.ivr.fi) is used as a fallback.
 // ---------------------------------------------------------------------------
-const twitchBadgeCache = { global: null, channels: new Map() };
+const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
+const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
+const TWITCH_BADGE_TTL_MS = 60 * 60 * 1000; // good result: keep 1 h
+const TWITCH_BADGE_FAIL_MS = 60 * 1000;     // failure: retry after 1 min
+const twitchBadgeCache = new Map();         // key -> { at, ttl, p }
+let twitchTok = { value: null, exp: 0 };
 
-function twitchBadgeSets(url, cacheSet, cacheGet) {
-  const hit = cacheGet();
-  if (hit) return hit;
-  const p = fetch(url, { signal: AbortSignal.timeout(8000) })
-    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then((j) => j.badge_sets || {})
-    .catch(() => { cacheSet(null); return {}; }); // retry on the next message
-  cacheSet(p);
-  return p;
+async function twitchAppToken() {
+  if (twitchTok.value && Date.now() < twitchTok.exp - 60000) return twitchTok.value;
+  const res = await fetch('https://id.twitch.tv/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: TWITCH_CLIENT_ID,
+      client_secret: TWITCH_CLIENT_SECRET,
+      grant_type: 'client_credentials'
+    }),
+    signal: AbortSignal.timeout(8000)
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.access_token) throw new Error(`Twitch auth failed (${res.status}): ${j.message || 'error'}`);
+  twitchTok = { value: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
+  return twitchTok.value;
 }
 
-// tags.badges looks like { moderator: '1', subscriber: '12' }; the images come
-// from Twitch's public (no auth) badge endpoints and are cached.
-async function twitchBadges(tags) {
+// Helix ({set_id, versions}) and IVR ({setID, versions}) -> { set: { versions: { id: {...} } } }
+function normBadgeSets(list) {
+  const out = {};
+  for (const s of Array.isArray(list) ? list : []) {
+    const id = s?.set_id || s?.setID;
+    if (!id) continue;
+    const versions = {};
+    for (const v of s.versions || []) {
+      versions[String(v.id ?? v.version)] = {
+        title: v.title,
+        image_url_1x: v.image_url_1x,
+        image_url_2x: v.image_url_2x
+      };
+    }
+    out[id] = { versions };
+  }
+  return out;
+}
+
+async function twitchJson(url, headers) {
+  const r = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+async function loadTwitchBadges(scope, roomId, login) {
+  if (TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET) {
+    try {
+      const token = await twitchAppToken();
+      const url = scope === 'global'
+        ? 'https://api.twitch.tv/helix/chat/badges/global'
+        : `https://api.twitch.tv/helix/chat/badges?broadcaster_id=${encodeURIComponent(roomId)}`;
+      const j = await twitchJson(url, { Authorization: `Bearer ${token}`, 'Client-Id': TWITCH_CLIENT_ID });
+      return normBadgeSets(j.data);
+    } catch (err) {
+      console.error(`[Twitch] Helix ${scope} badges failed:`, err?.message || err);
+      twitchTok = { value: null, exp: 0 };
+    }
+  }
+  // Fallback without credentials (third-party, community run).
+  try {
+    const url = scope === 'global'
+      ? 'https://api.ivr.fi/v2/twitch/badges/global'
+      : `https://api.ivr.fi/v2/twitch/badges/channel?login=${encodeURIComponent(login)}`;
+    return normBadgeSets(await twitchJson(url, { Accept: 'application/json' }));
+  } catch (err) {
+    console.error(`[Twitch] IVR ${scope} badges failed:`, err?.message || err);
+    return null;
+  }
+}
+
+function twitchBadgeSets(scope, roomId = '', login = '') {
+  const key = scope === 'global' ? 'global' : `channel:${roomId}`;
+  const hit = twitchBadgeCache.get(key);
+  if (hit && Date.now() - hit.at < hit.ttl) return hit.p;
+  const entry = { at: Date.now(), ttl: TWITCH_BADGE_TTL_MS, p: null };
+  entry.p = loadTwitchBadges(scope, roomId, login).then((v) => {
+    if (!v) { entry.ttl = TWITCH_BADGE_FAIL_MS; return {}; }
+    console.log(`[Twitch] Loaded ${scope} badge sets: ${Object.keys(v).length}`);
+    return v;
+  });
+  twitchBadgeCache.set(key, entry);
+  return entry.p;
+}
+
+// tags.badges looks like { moderator: '1', subscriber: '12' }.
+// Channel sets override global ones (custom sub / bits badges).
+async function twitchBadges(tags, login = '') {
   const raw = tags.badges;
   if (!raw || typeof raw !== 'object') return [];
   const room = tags['room-id'];
   const [glob, chan] = await Promise.all([
-    twitchBadgeSets('https://badges.twitch.tv/v1/badges/global/display', (v) => { twitchBadgeCache.global = v; }, () => twitchBadgeCache.global),
-    room
-      ? twitchBadgeSets(`https://badges.twitch.tv/v1/badges/channels/${encodeURIComponent(room)}/display`, (v) => (v ? twitchBadgeCache.channels.set(room, v) : twitchBadgeCache.channels.delete(room)), () => twitchBadgeCache.channels.get(room))
-      : {}
+    twitchBadgeSets('global'),
+    room ? twitchBadgeSets('channel', room, login) : {}
   ]);
   return Object.entries(raw).map(([name, version]) => {
     const v = chan[name]?.versions?.[version] || glob[name]?.versions?.[version];
@@ -776,7 +857,7 @@ async function connectTwitch(channel) {
   client.on('message', async (_c, tags, message, self) => {
     if (self || !isCurrent()) return;
     let badges = [];
-    try { badges = await twitchBadges(tags); } catch {}
+    try { badges = await twitchBadges(tags, chan); } catch {}
     if (!isCurrent()) return;
     broadcastMessage(normalizeMessage('twitch', tags['display-name'] || tags.username, message, '', tags.id ? `twitch-${tags.id}` : null, badges));
   });
@@ -799,6 +880,8 @@ async function connectTwitch(channel) {
 // Setup: https://kick.com/settings/developer -> create an app, then set
 //   env KICK_CLIENT_ID, KICK_CLIENT_SECRET
 //   Webhook URL in the Kick app settings: https://YOUR-HOST/webhooks/kick
+// Kick badges come as { type, text, count? } with no image URL, so the overlay
+// has to draw them by `type` (moderator, subscriber, sub_gifter, vip, og, ...).
 // ---------------------------------------------------------------------------
 const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID;
 const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET;
@@ -934,9 +1017,14 @@ async function handleKickWebhook(req, res) {
     const active = activeAdapters.kick.instance;
     if (!active || Number(p.broadcaster?.user_id) !== active.broadcasterId) return;
 
+    // Badge label includes the count when Kick sends one (e.g. "Subscriber 3").
+    const kickBadges = (p.sender?.identity?.badges || []).map((b) => ({
+      type: b.type,
+      label: `${b.text || b.type}${Number.isFinite(b.count) && b.count > 0 ? ` ${b.count}` : ''}`
+    }));
+
     broadcastMessage(
-      normalizeMessage('kick', p.sender?.username, p.content, p.sender?.profile_picture || '', p.message_id ? `kick-${p.message_id}` : null,
-        (p.sender?.identity?.badges || []).map((b) => ({ type: b.type, label: b.text || b.type })))
+      normalizeMessage('kick', p.sender?.username, p.content, p.sender?.profile_picture || '', p.message_id ? `kick-${p.message_id}` : null, kickBadges)
     );
   } catch (err) {
     console.error('[Kick Webhook] Error:', err);
@@ -1170,7 +1258,7 @@ io.on('connection', (socket) => {
 // ---------------------------------------------------------------------------
 // Start / shutdown
 // ---------------------------------------------------------------------------
-server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: yt-candidates-v3]`));
+server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: badges-v4]`));
 
 function shutdown() {
   console.log('Shutting down, stopping adapters...');
