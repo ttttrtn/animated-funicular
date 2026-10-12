@@ -322,35 +322,69 @@ async function liveIdFromLivePage(pathPart) {
     const html = await ytFetchHtml(`https://www.youtube.com/${pathPart}/live`);
     const m = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
     if (!m) return null;
-    return /"isLiveNow":\s*true|"isLive":\s*true|"isLiveContent":\s*true/.test(html) ? m[1] : null;
+    return m[1];
   } catch {
     return null;
   }
 }
 
-async function findLiveVideoId(yt, t) {
-  const livePath = t.type === 'handle' ? `@${t.value}` : `channel/${t.value}`;
-
-  // 1. Scrape the channel's /live page (works without Innertube parsing).
-  let id = await liveIdFromLivePage(livePath);
-  if (id) { console.log(`[YouTube] ${t.label}: found live video ${id} via /live page`); return id; }
-
-  // 2. Fall back to Innertube channel lookup.
-  let channelId = t.value;
-  if (t.type === 'handle') {
-    channelId = await channelIdFromHandle(yt, t.value);
-    if (!channelId) throw codeErr('NOT_FOUND', `YouTube channel @${t.value} not found`);
-  }
+// RSS feed lists a channel's newest uploads and streams (no Innertube parsing).
+async function ytFeedVideoIds(channelId) {
   try {
-    const channel = await yt.getChannel(channelId);
-    if (channel.has_live_streams) id = pickLiveVideoId((await channel.getLiveStreams()).videos);
-    if (!id) id = pickLiveVideoId(channel.videos);
-  } catch (err) {
-    console.error('[YouTube] Channel lookup failed:', err?.message || err);
+    const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!res.ok) return [];
+    const xml = await res.text();
+    return [...xml.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)].map((m) => m[1]).slice(0, 6);
+  } catch {
+    return [];
   }
-  if (!id) throw codeErr('NOT_LIVE', `${t.label} is not live right now`);
-  console.log(`[YouTube] ${t.label}: found live video ${id} via Innertube`);
-  return id;
+}
+
+// Collects candidate video IDs from several sources, then keeps the first one
+// that really has an ACTIVE live chat (ended streams only have a replay chat).
+async function findLiveVideoId(yt, t) {
+  const candidates = [];
+  const add = (id, src) => { if (id && YT_VIDEO_ID.test(id) && !candidates.some((c) => c.id === id)) candidates.push({ id, src }); };
+
+  let channelId = t.type === 'handle' ? await channelIdFromHandle(yt, t.value) : t.value;
+
+  // 1. The channel's /live page redirects to the current stream.
+  add(await liveIdFromLivePage(t.type === 'handle' ? `@${t.value}` : `channel/${t.value}`), '/live page');
+
+  if (!channelId && !candidates.length) throw codeErr('NOT_FOUND', `YouTube channel ${t.label} not found`);
+
+  if (channelId) {
+    // 2. Innertube channel tabs.
+    try {
+      const channel = await yt.getChannel(channelId);
+      if (channel.has_live_streams) add(pickLiveVideoId((await channel.getLiveStreams()).videos), 'Innertube streams tab');
+      add(pickLiveVideoId(channel.videos), 'Innertube home');
+    } catch (err) {
+      console.error('[YouTube] Channel lookup failed:', err?.message || err);
+    }
+    // 3. RSS feed: newest uploads/streams.
+    for (const id of await ytFeedVideoIds(channelId)) add(id, 'RSS feed');
+  }
+
+  console.log(`[YouTube] ${t.label}: ${candidates.length} candidate(s): ${candidates.map((c) => `${c.id} (${c.src})`).join(', ') || 'none'}`);
+
+  let lastErr = null;
+  for (const c of candidates) {
+    try {
+      if (await ytChatStart(yt, c.id)) {
+        console.log(`[YouTube] ${t.label}: live chat found on ${c.id} via ${c.src}`);
+        return c.id;
+      }
+    } catch (e) {
+      lastErr = e;
+      console.error(`[YouTube] Chat check failed for ${c.id}:`, e?.message || e);
+    }
+  }
+  if (lastErr) throw lastErr; // show the real error (e.g. 403) instead of "not live"
+  throw codeErr('NOT_LIVE', `${t.label} is not live right now`);
 }
 
 // --- Chat parsing (raw InnerTube JSON; avoids the /player endpoint, which
