@@ -111,7 +111,7 @@ function cleanBadges(list) {
       if (!o || typeof o !== 'object') return null;
       const type = String(o.type || o.name || 'badge').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 30) || 'badge';
       const label = escapeHtml(String(o.label || o.text || o.title || type).slice(0, 40));
-      const url = typeof o.url === 'string' && /^https:\/\//i.test(o.url) ? o.url : '';
+      const url = typeof o.url === 'string' && (/^https:\/\//i.test(o.url) || /^\/icons\/[\w./-]+\.svg$/.test(o.url)) ? o.url : '';
       return { type, label, url };
     })
     .filter(Boolean);
@@ -928,6 +928,51 @@ async function kickApi(method, pathAndQuery, body, retried = false) {
   return j;
 }
 
+// Kick's webhook sends badges as { type, text, count? } without images, and
+// Kick's own role badges are bundled inside its website (no public URL). So:
+//  - role badges use the icons in public/icons/kick/ (served by this server)
+//  - the channel's custom subscriber badges are fetched best-effort from Kick's
+//    unofficial website API (may be blocked; falls back to the local icon)
+const KICK_ICON_FILES = new Set(['broadcaster', 'moderator', 'vip', 'og', 'founder', 'subscriber', 'staff', 'verified', 'subgifter', 'sidekick']);
+
+function kickBadgeIcon(type, count) {
+  const key = String(type || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const k = key === 'owner' ? 'broadcaster' : key === 'mod' ? 'moderator' : key;
+  if (k === 'subgifter') {
+    const tier = [200, 100, 50, 25].find((t) => Number(count) >= t);
+    return `/icons/kick/subgifter${tier || ''}.svg`;
+  }
+  return KICK_ICON_FILES.has(k) ? `/icons/kick/${k}.svg` : '/icons/kick/unknown.svg';
+}
+
+async function kickChannelSubBadges(slug) {
+  try {
+    const r = await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
+      headers: { Accept: 'application/json', 'User-Agent': YT_UA },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const list = (j.subscriber_badges || [])
+      .map((b) => ({ months: Number(b.months) || 0, url: b.badge_image?.src || '' }))
+      .filter((b) => /^https:\/\//i.test(b.url))
+      .sort((a, b) => a.months - b.months);
+    console.log(`[Kick] ${slug}: ${list.length} custom subscriber badge(s)`);
+    return list;
+  } catch (err) {
+    console.log(`[Kick] Custom sub badges unavailable for ${slug} (${err?.message || err}); using default icons`);
+    return [];
+  }
+}
+
+function kickSubBadgeUrl(list, months) {
+  if (!list?.length) return '';
+  const m = Number(months) || 0;
+  let pick = list[0];
+  for (const b of list) if (b.months <= m) pick = b;
+  return pick.url;
+}
+
 async function connectKick(slug) {
   disconnectPlatform('kick');
   const clean = String(slug || '').toLowerCase().trim().replace(/^@/, '');
@@ -966,7 +1011,9 @@ async function connectKick(slug) {
     }
 
     if (activeAdapters.kick.token !== token) return; // cancelled meanwhile
-    activeAdapters.kick.instance = { broadcasterId, slug: clean };
+    const subBadges = await kickChannelSubBadges(clean);
+    if (activeAdapters.kick.token !== token) return;
+    activeAdapters.kick.instance = { broadcasterId, slug: clean, subBadges };
     updatePlatformStatus('kick', 'connected', clean);
   } catch (err) {
     console.error('[Kick] Connect failed:', err?.message || err);
@@ -1017,11 +1064,15 @@ async function handleKickWebhook(req, res) {
     const active = activeAdapters.kick.instance;
     if (!active || Number(p.broadcaster?.user_id) !== active.broadcasterId) return;
 
-    // Badge label includes the count when Kick sends one (e.g. "Subscriber 3").
-    const kickBadges = (p.sender?.identity?.badges || []).map((b) => ({
-      type: b.type,
-      label: `${b.text || b.type}${Number.isFinite(b.count) && b.count > 0 ? ` ${b.count}` : ''}`
-    }));
+    const kickBadges = (p.sender?.identity?.badges || []).map((b) => {
+      const count = Number.isFinite(b.count) && b.count > 0 ? b.count : 0;
+      const isSub = String(b.type).toLowerCase() === 'subscriber';
+      return {
+        type: b.type,
+        label: `${b.text || b.type}${count ? ` ${count}` : ''}`,
+        url: (isSub && kickSubBadgeUrl(active.subBadges, count)) || kickBadgeIcon(b.type, count)
+      };
+    });
 
     broadcastMessage(
       normalizeMessage('kick', p.sender?.username, p.content, p.sender?.profile_picture || '', p.message_id ? `kick-${p.message_id}` : null, kickBadges)
