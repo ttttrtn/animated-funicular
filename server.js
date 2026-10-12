@@ -5,7 +5,6 @@ const { spawn } = require('child_process');
 const path = require('path');
 const axios = require('axios');
 const tmi = require('tmi.js');
-const WebSocket = require('ws');
 const { Innertube } = require('youtubei.js');
 require('dotenv').config();
 
@@ -131,7 +130,7 @@ function connectTwitch(channel) {
   activeAdapters.twitch.client = client;
 }
 
-// 4. Kick Chat Adapter (Python Subprocess with TLS Fingerprinting via curl_cffi)
+// 4. Kick Chat Adapter (Python Subprocess)
 function connectKick(slug) {
   disconnectPlatform('kick');
   updatePlatformStatus('kick', 'connecting', slug);
