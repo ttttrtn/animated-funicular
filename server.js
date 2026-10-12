@@ -70,7 +70,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-const PLATFORMS = ['youtube', 'tiktok', 'twitch', 'kick', 'facebook', 'rumble'];
+const PLATFORMS = ['youtube', 'tiktok', 'twitch', 'kick', 'facebook', 'rumble', 'x', 'instagram'];
 
 const blankAdapter = () => ({
   status: 'disconnected',
@@ -111,7 +111,7 @@ function cleanBadges(list) {
       if (!o || typeof o !== 'object') return null;
       const type = String(o.type || o.name || 'badge').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 30) || 'badge';
       const label = escapeHtml(String(o.label || o.text || o.title || type).slice(0, 40));
-      const url = typeof o.url === 'string' && (/^https:\/\//i.test(o.url) || /^\/icons\/(?:[\w-]+\/)*[\w-]+\.svg$/.test(o.url)) ? o.url : '';
+      const url = typeof o.url === 'string' && (/^https:\/\//i.test(o.url) || /^\/icons\/(?:[\w-]+\/)*[\w-]+\.(?:svg|png|webp|gif|jpg)$/.test(o.url)) ? o.url : '';
       return { type, label, url };
     })
     .filter(Boolean);
@@ -1228,13 +1228,21 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// X, Facebook and Instagram live in adapters/ (see the comment at the top of each file).
+const adapterCtx = { activeAdapters, updatePlatformStatus, normalizeMessage, broadcastMessage, makeSeen, disconnectPlatform };
+const xAdapter = require('./adapters/x').init(adapterCtx);
+const fbAdapter = require('./adapters/facebook').init(adapterCtx);
+const igAdapter = require('./adapters/instagram').init(adapterCtx);
+
 const connectors = {
   youtube: connectYouTube,
   tiktok: connectTikTok,
   twitch: connectTwitch,
   kick: connectKick,
-  facebook: (h) => connectUnsupported('facebook', h),
-  rumble: connectRumble
+  facebook: fbAdapter.connectFacebook,
+  rumble: connectRumble,
+  x: xAdapter.connectX,
+  instagram: igAdapter.connectInstagram
 };
 
 app.post('/api/connect', requireAuth, (req, res) => {
@@ -1246,6 +1254,13 @@ app.post('/api/connect', requireAuth, (req, res) => {
   }
   Promise.resolve(connect(handle.trim())).catch((err) => console.error(`[${platform}] connect crashed:`, err));
   res.json({ success: true });
+});
+
+// Pops out the Instagram login window on the machine running this server.
+app.post('/api/instagram/login', requireAuth, (_req, res) => {
+  igAdapter.openLogin()
+    .then(() => res.json({ success: true }))
+    .catch((err) => res.status(500).json({ error: String(err?.message || err) }));
 });
 
 app.post('/api/disconnect', requireAuth, (req, res) => {
@@ -1274,7 +1289,10 @@ app.get('/health', (_req, res) => res.status(200).send('OK'));
 // value, and changes are rate-limited because this endpoint has no password.
 // Optional: set env OVERLAY_KEY and add &key=THAT_VALUE to require it.
 // ---------------------------------------------------------------------------
-const OVERLAY_PLATFORMS = ['twitch', 'kick', 'youtube', 'tiktok', 'rumble'];
+const OVERLAY_PLATFORMS = ['twitch', 'kick', 'youtube', 'tiktok', 'rumble', 'x', 'facebook', 'instagram'];
+// These use server-side credentials or open a window, so they only start from an
+// overlay URL when OVERLAY_KEY is set (and the URL carries &key=...).
+const OVERLAY_KEY_REQUIRED = new Set(['facebook', 'instagram']);
 const OVERLAY_COOLDOWN_MS = 15000;
 const overlayState = {}; // platform -> { fp, at }
 
@@ -1287,6 +1305,10 @@ function applyOverlayConfig(cfg) {
   for (const p of OVERLAY_PLATFORMS) {
     const raw = cfg[p];
     if (typeof raw !== 'string' || !raw.trim() || raw.length > 400) continue;
+    if (OVERLAY_KEY_REQUIRED.has(p) && !process.env.OVERLAY_KEY) {
+      if (!overlayState[`warn-${p}`]) { overlayState[`warn-${p}`] = true; console.warn(`[Overlay] ${p} from the overlay URL is ignored: set OVERLAY_KEY and add &key=... to allow it`); }
+      continue;
+    }
     const handle = raw.trim();
     const fp = crypto.createHash('sha256').update(handle).digest('hex');
     const prev = overlayState[p];
@@ -1309,7 +1331,7 @@ io.on('connection', (socket) => {
 // ---------------------------------------------------------------------------
 // Start / shutdown
 // ---------------------------------------------------------------------------
-server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: badges-v4]`));
+server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: platforms-v5]`));
 
 function shutdown() {
   console.log('Shutting down, stopping adapters...');
