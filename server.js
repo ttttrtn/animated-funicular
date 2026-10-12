@@ -1,233 +1,399 @@
+'use strict';
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
+const path = require('path');
 const { Server } = require('socket.io');
 const { spawn } = require('child_process');
-const path = require('path');
-const axios = require('axios');
 const tmi = require('tmi.js');
 const { Innertube } = require('youtubei.js');
-require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 const PORT = process.env.PORT || 3000;
-const DASHBOARD_PASS = process.env.DASHBOARD_PASS || 'MalikGPT2026!';
+const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
 
-app.use(express.json());
+// ---------------------------------------------------------------------------
+// Auth: password comes from the environment only (no hardcoded default).
+// If DASHBOARD_PASS is not set, a random one is generated and printed once.
+// ---------------------------------------------------------------------------
+let DASHBOARD_PASS = process.env.DASHBOARD_PASS;
+if (!DASHBOARD_PASS) {
+  DASHBOARD_PASS = crypto.randomBytes(9).toString('base64url');
+  console.warn(`[Auth] DASHBOARD_PASS not set. Temporary password for this run: ${DASHBOARD_PASS}`);
+}
+const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
+const passOk = (given) => crypto.timingSafeEqual(sha(given), sha(DASHBOARD_PASS));
+
+app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-const activeAdapters = {
-  youtube: { status: 'disconnected', handle: '', instance: null },
-  tiktok: { status: 'disconnected', handle: '', process: null },
-  twitch: { status: 'disconnected', handle: '', client: null },
-  kick: { status: 'disconnected', handle: '', process: null },
-  facebook: { status: 'disconnected', handle: '', timer: null },
-  rumble: { status: 'disconnected', handle: '', timer: null }
-};
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const PLATFORMS = ['youtube', 'tiktok', 'twitch', 'kick', 'facebook', 'rumble'];
 
+const blankAdapter = () => ({
+  status: 'disconnected',
+  handle: '',
+  error: '',
+  instance: null,
+  process: null,
+  client: null,
+  timer: null,
+  retry: null,
+  token: null
+});
+
+const activeAdapters = Object.fromEntries(PLATFORMS.map((p) => [p, blankAdapter()]));
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 function normalizeMessage(platform, username, message, avatar = '', id = null) {
-  const cleanUsername = String(username || 'Anonymous').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const cleanMessage = String(message || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const esc = (v) => String(v).replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return {
     id: id || `${platform}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
     platform: platform.toLowerCase(),
-    username: cleanUsername,
-    message: cleanMessage,
+    username: esc(username || 'Anonymous'),
+    message: esc(message || ''),
     avatar: avatar || `/icons/${platform.toLowerCase()}.svg`,
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   };
 }
 
-function broadcastMessage(normalizedMsg) {
-  io.emit('chatMessage', normalizedMsg);
+function broadcastMessage(msg) {
+  io.emit('chatMessage', msg);
 }
 
-function updatePlatformStatus(platform, status, handle = '') {
-  activeAdapters[platform].status = status;
-  if (handle) activeAdapters[platform].handle = handle;
-  io.emit('statusUpdate', { platform, status: activeAdapters[platform].status, handle: activeAdapters[platform].handle });
+// For status "error" the message is also sent in `handle` so existing
+// dashboards that display `handle` keep working; `error` is the clean field.
+function updatePlatformStatus(platform, status, handle = '', error = '') {
+  const a = activeAdapters[platform];
+  a.status = status;
+  if (handle) a.handle = handle;
+  a.error = status === 'error' ? error || handle : '';
+  io.emit('statusUpdate', {
+    platform,
+    status,
+    handle: status === 'error' ? a.error : a.handle,
+    error: a.error
+  });
 }
 
-// 1. YouTube Live Chat Adapter
-async function connectYouTube(videoIdOrUrl) {
+function snapshot(platform) {
+  const a = activeAdapters[platform];
+  return { platform, status: a.status, handle: a.status === 'error' ? a.error : a.handle, error: a.error };
+}
+
+// ---------------------------------------------------------------------------
+// Generic Python bridge runner (used by TikTok and Kick)
+// Bridge protocol: one JSON object per stdout line:
+//   {type:'log'|'status'|'message'|'error', ...}
+// ---------------------------------------------------------------------------
+const BRIDGE_MAX_RETRIES = 8;
+
+function startBridge(platform, script, arg, attempt = 0) {
+  const label = platform[0].toUpperCase() + platform.slice(1);
+  const adapter = activeAdapters[platform];
+  clearTimeout(adapter.retry);
+
+  updatePlatformStatus(platform, 'connecting', arg);
+  console.log(`[${label}] Spawning Python bridge for "${arg}" (attempt ${attempt + 1})`);
+
+  // -u + PYTHONUNBUFFERED: piped Python stdout is block-buffered otherwise.
+  const proc = spawn(PYTHON_BIN, ['-u', path.join(__dirname, 'python', script), arg], {
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  adapter.process = proc;
+
+  const isCurrent = () => activeAdapters[platform].process === proc;
+  let fatal = false;
+  let buffer = '';
+
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    let p;
+    try {
+      p = JSON.parse(line);
+    } catch {
+      console.log(`[${label} Raw Out] ${line}`);
+      return;
+    }
+    if (!isCurrent()) return;
+
+    switch (p.type) {
+      case 'log':
+        console.log(`[${label} Bridge] ${p.message}`);
+        break;
+      case 'status':
+        console.log(`[${label} Status] ${p.status} (${p.handle || arg})`);
+        if (p.status === 'connected') attempt = 0;
+        updatePlatformStatus(platform, p.status, arg);
+        break;
+      case 'message':
+        try {
+          broadcastMessage(normalizeMessage(platform, p.username, p.message, p.avatar || '', p.id));
+        } catch (err) {
+          console.error(`[${label}] broadcast failed:`, err);
+        }
+        break;
+      case 'error':
+        console.error(`[${label} Error] ${p.message}`);
+        if (p.fatal) fatal = true;
+        updatePlatformStatus(platform, 'error', arg, p.message);
+        break;
+    }
+  };
+
+  proc.stdout.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // keep the unfinished tail for the next chunk
+    lines.forEach(handleLine);
+  });
+
+  proc.stderr.on('data', (d) => console.error(`[${label} Python Stderr] ${d.toString().trimEnd()}`));
+
+  proc.on('error', (err) => {
+    console.error(`[${label}] Could not start "${PYTHON_BIN}": ${err.message}`);
+    if (isCurrent()) updatePlatformStatus(platform, 'error', arg, `Cannot start Python (${err.code || err.message})`);
+  });
+
+  proc.on('close', (code, signal) => {
+    if (buffer.trim()) { handleLine(buffer); buffer = ''; }
+    console.log(`[${label}] Bridge exited (code=${code}, signal=${signal})`);
+    if (!isCurrent()) return; // old process killed by reconnect/disconnect
+
+    adapter.process = null;
+    const lastWasError = adapter.status === 'error';
+    if (!lastWasError) updatePlatformStatus(platform, 'disconnected');
+
+    if (!fatal && attempt < BRIDGE_MAX_RETRIES) {
+      const delay = Math.min(2000 * 2 ** attempt, 60000);
+      console.log(`[${label}] Reconnecting in ${delay / 1000}s...`);
+      adapter.retry = setTimeout(() => startBridge(platform, script, arg, attempt + 1), delay);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 1. YouTube
+// ---------------------------------------------------------------------------
+function parseYouTubeId(input) {
+  const s = String(input || '').trim();
+  if (/^[\w-]{11}$/.test(s)) return s;
+  const m = s.match(/(?:[?&]v=|youtu\.be\/|\/live\/|\/embed\/)([\w-]{11})/);
+  return m ? m[1] : null;
+}
+
+async function connectYouTube(input) {
+  disconnectPlatform('youtube');
+  const videoId = parseYouTubeId(input);
+  if (!videoId) return updatePlatformStatus('youtube', 'error', String(input), 'Invalid YouTube video ID or URL');
+
+  const token = Symbol('yt');
+  activeAdapters.youtube.token = token;
+  updatePlatformStatus('youtube', 'connecting', videoId);
+
   try {
-    disconnectPlatform('youtube');
-    updatePlatformStatus('youtube', 'connecting', videoIdOrUrl);
-    let videoId = videoIdOrUrl;
-    if (videoIdOrUrl.includes('v=')) videoId = videoIdOrUrl.split('v=')[1].split('&')[0];
-    if (videoIdOrUrl.includes('youtu.be/')) videoId = videoIdOrUrl.split('youtu.be/')[1].split('?')[0];
+    const yt = await Innertube.create();
+    const info = await yt.getInfo(videoId);
+    if (activeAdapters.youtube.token !== token) return; // cancelled meanwhile
 
-    const youtube = await Innertube.create();
-    const info = await youtube.getInfo(videoId);
     const liveChat = info.getLiveChat();
+    const seen = new Set();
 
+    const emit = (item) => {
+      const text = item?.message?.toString?.() || '';
+      if (!text) return;
+      const id = item.id ? `youtube-${item.id}` : null;
+      if (id) {
+        if (seen.has(id)) return;
+        seen.add(id);
+        if (seen.size > 1000) seen.delete(seen.values().next().value);
+      }
+      broadcastMessage(
+        normalizeMessage('youtube', item.author?.name?.toString?.() || 'Viewer', text, item.author?.thumbnails?.[0]?.url || '', id)
+      );
+    };
+
+    // Newer youtubei.js emits 'chat-update'; older versions emitted 'chat-item'.
+    liveChat.on('chat-update', (action) => {
+      if (activeAdapters.youtube.token !== token) return;
+      if (action?.type === 'AddChatItemAction') emit(action.item);
+    });
     liveChat.on('chat-item', (item) => {
-      const msg = item.message?.toString() || '';
-      const author = item.author?.name?.toString() || 'Viewer';
-      const avatar = item.author?.thumbnails?.[0]?.url || '';
-      if (msg) broadcastMessage(normalizeMessage('youtube', author, msg, avatar));
+      if (activeAdapters.youtube.token === token) emit(item);
+    });
+    liveChat.on('error', (err) => {
+      console.error('[YouTube] Live chat error:', err?.message || err);
+      if (activeAdapters.youtube.token === token) updatePlatformStatus('youtube', 'error', videoId, String(err?.message || err));
+    });
+    liveChat.on('end', () => {
+      if (activeAdapters.youtube.token === token) updatePlatformStatus('youtube', 'disconnected');
     });
 
     liveChat.start();
     activeAdapters.youtube.instance = liveChat;
     updatePlatformStatus('youtube', 'connected', videoId);
   } catch (err) {
-    updatePlatformStatus('youtube', 'error', err.message);
+    console.error('[YouTube] Connect failed:', err?.message || err);
+    if (activeAdapters.youtube.token === token) updatePlatformStatus('youtube', 'error', videoId, String(err?.message || err));
   }
 }
 
-// 2. TikTok Live Chat Adapter (Python TikTokLive Subprocess)
+// ---------------------------------------------------------------------------
+// 2. TikTok (Python bridge)
+// ---------------------------------------------------------------------------
 function connectTikTok(username) {
   disconnectPlatform('tiktok');
-  updatePlatformStatus('tiktok', 'connecting', username);
-  const cleanUser = username.replace('@', '').trim();
-  const pythonProc = spawn('python3', [path.join(__dirname, 'python', 'tiktok_bridge.py'), cleanUser]);
-  activeAdapters.tiktok.process = pythonProc;
-
-  pythonProc.stdout.on('data', (data) => {
-    const lines = data.toString().split('\n');
-    lines.forEach((line) => {
-      if (!line.trim()) return;
-      try {
-        const payload = JSON.parse(line);
-        if (payload.type === 'status') {
-          updatePlatformStatus('tiktok', payload.status, cleanUser);
-        } else if (payload.type === 'message') {
-          broadcastMessage(normalizeMessage('tiktok', payload.username, payload.message, payload.avatar, payload.id));
-        } else if (payload.type === 'error') {
-          updatePlatformStatus('tiktok', 'error', payload.message);
-        }
-      } catch (e) {}
-    });
-  });
-
-  pythonProc.on('close', () => {
-    updatePlatformStatus('tiktok', 'disconnected');
-  });
+  const user = String(username || '').replace(/^@/, '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._]{0,39}$/.test(user)) {
+    return updatePlatformStatus('tiktok', 'error', String(username), 'Invalid TikTok username');
+  }
+  startBridge('tiktok', 'tiktok_bridge.py', user);
 }
 
-// 3. Twitch Chat Adapter
-function connectTwitch(channel) {
+// ---------------------------------------------------------------------------
+// 3. Twitch
+// ---------------------------------------------------------------------------
+async function connectTwitch(channel) {
   disconnectPlatform('twitch');
-  updatePlatformStatus('twitch', 'connecting', channel);
-  const cleanChan = channel.replace('#', '').trim();
-  const client = new tmi.Client({ channels: [cleanChan] });
+  const chan = String(channel || '').replace(/^#/, '').trim().toLowerCase();
+  if (!/^[a-z0-9_]{3,25}$/.test(chan)) {
+    return updatePlatformStatus('twitch', 'error', String(channel), 'Invalid Twitch channel');
+  }
 
-  client.connect().then(() => {
-    updatePlatformStatus('twitch', 'connected', cleanChan);
-  }).catch((err) => {
-    updatePlatformStatus('twitch', 'error', err.message);
-  });
-
-  client.on('message', (chan, tags, message, self) => {
-    if (self) return;
-    const author = tags['display-name'] || tags.username;
-    broadcastMessage(normalizeMessage('twitch', author, message));
-  });
-
+  updatePlatformStatus('twitch', 'connecting', chan);
+  const client = new tmi.Client({ channels: [chan] });
   activeAdapters.twitch.client = client;
+  const isCurrent = () => activeAdapters.twitch.client === client;
+
+  client.on('message', (_c, tags, message, self) => {
+    if (self || !isCurrent()) return;
+    broadcastMessage(normalizeMessage('twitch', tags['display-name'] || tags.username, message, '', tags.id ? `twitch-${tags.id}` : null));
+  });
+  client.on('disconnected', () => {
+    if (isCurrent() && activeAdapters.twitch.status !== 'error') updatePlatformStatus('twitch', 'disconnected');
+  });
+  client.on('connected', () => {
+    if (isCurrent()) updatePlatformStatus('twitch', 'connected', chan);
+  });
+
+  try {
+    await client.connect();
+  } catch (err) {
+    if (isCurrent()) updatePlatformStatus('twitch', 'error', chan, String(err?.message || err));
+  }
 }
 
-// 4. Kick Chat Adapter (Python Subprocess)
+// ---------------------------------------------------------------------------
+// 4. Kick (Python bridge)
+// ---------------------------------------------------------------------------
 function connectKick(slug) {
   disconnectPlatform('kick');
-  updatePlatformStatus('kick', 'connecting', slug);
-  const cleanSlug = slug.toLowerCase().trim();
-
-  const pythonProc = spawn('python3', [path.join(__dirname, 'python', 'kick_bridge.py'), cleanSlug]);
-  activeAdapters.kick.process = pythonProc;
-
-  pythonProc.stdout.on('data', (data) => {
-    const lines = data.toString().split('\n');
-    lines.forEach((line) => {
-      if (!line.trim()) return;
-      try {
-        const payload = JSON.parse(line);
-        if (payload.type === 'status') {
-          updatePlatformStatus('kick', payload.status, cleanSlug);
-        } else if (payload.type === 'message') {
-          broadcastMessage(normalizeMessage('kick', payload.username, payload.message, '', payload.id));
-        } else if (payload.type === 'error') {
-          updatePlatformStatus('kick', 'error', payload.message);
-        }
-      } catch (e) {}
-    });
-  });
-
-  pythonProc.on('close', () => {
-    updatePlatformStatus('kick', 'disconnected');
-  });
+  const clean = String(slug || '').toLowerCase().trim().replace(/^@/, '');
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(clean)) {
+    return updatePlatformStatus('kick', 'error', String(slug), 'Invalid Kick channel name');
+  }
+  startBridge('kick', 'kick_bridge.py', clean);
 }
 
-// 5. Facebook Live Adapter
-function connectFacebook(pageId) {
-  disconnectPlatform('facebook');
-  updatePlatformStatus('facebook', 'connecting', pageId);
-  const timer = setInterval(() => { updatePlatformStatus('facebook', 'connected', pageId); }, 5000);
-  activeAdapters.facebook.timer = timer;
+// ---------------------------------------------------------------------------
+// 5 & 6. Facebook / Rumble: not implemented. The old version showed a fake
+// "connected" status every 5 s, which was misleading, so they now report it.
+// ---------------------------------------------------------------------------
+function connectUnsupported(platform, handle) {
+  disconnectPlatform(platform);
+  updatePlatformStatus(platform, 'error', String(handle || ''), `${platform} chat is not implemented yet`);
 }
 
-// 6. Rumble Live Adapter
-function connectRumble(channel) {
-  disconnectPlatform('rumble');
-  updatePlatformStatus('rumble', 'connecting', channel);
-  const timer = setInterval(() => { updatePlatformStatus('rumble', 'connected', channel); }, 5000);
-  activeAdapters.rumble.timer = timer;
+// ---------------------------------------------------------------------------
+// Disconnect
+// ---------------------------------------------------------------------------
+function disconnectPlatform(platform, { silent = false } = {}) {
+  const a = activeAdapters[platform];
+  if (!a) return;
+
+  clearTimeout(a.retry);
+  clearInterval(a.timer);
+  try { a.instance?.stop?.(); } catch {}
+  try { a.process?.kill('SIGTERM'); } catch {}
+  try { a.client?.disconnect?.().catch?.(() => {}); } catch {}
+
+  activeAdapters[platform] = blankAdapter();
+  if (!silent) updatePlatformStatus(platform, 'disconnected');
 }
 
-function disconnectPlatform(platform) {
-  const adapter = activeAdapters[platform];
-  if (!adapter) return;
-
-  if (platform === 'youtube' && adapter.instance) { try { adapter.instance.stop(); } catch (e) {} }
-  else if ((platform === 'tiktok' || platform === 'kick') && adapter.process) { try { adapter.process.kill(); } catch (e) {} }
-  else if (platform === 'twitch' && adapter.client) { try { adapter.client.disconnect(); } catch (e) {} }
-  else if (adapter.timer) { clearInterval(adapter.timer); }
-
-  activeAdapters[platform] = { status: 'disconnected', handle: '', instance: null, process: null, client: null, timer: null };
-  updatePlatformStatus(platform, 'disconnected');
+// ---------------------------------------------------------------------------
+// API
+// ---------------------------------------------------------------------------
+function requireAuth(req, res, next) {
+  const given = req.body?.auth;
+  if (typeof given !== 'string' || !passOk(given)) return res.status(401).json({ error: 'Unauthorized' });
+  next();
 }
 
-app.post('/api/connect', (req, res) => {
-  const { auth, platform, handle } = req.body;
-  if (auth !== DASHBOARD_PASS) return res.status(401).json({ error: 'Unauthorized' });
+const connectors = {
+  youtube: connectYouTube,
+  tiktok: connectTikTok,
+  twitch: connectTwitch,
+  kick: connectKick,
+  facebook: (h) => connectUnsupported('facebook', h),
+  rumble: (h) => connectUnsupported('rumble', h)
+};
 
-  if (platform === 'youtube') connectYouTube(handle);
-  else if (platform === 'tiktok') connectTikTok(handle);
-  else if (platform === 'twitch') connectTwitch(handle);
-  else if (platform === 'kick') connectKick(handle);
-  else if (platform === 'facebook') connectFacebook(handle);
-  else if (platform === 'rumble') connectRumble(handle);
-  else return res.status(400).json({ error: 'Unsupported platform' });
-
+app.post('/api/connect', requireAuth, (req, res) => {
+  const { platform, handle } = req.body;
+  const connect = Object.prototype.hasOwnProperty.call(connectors, platform) ? connectors[platform] : null;
+  if (!connect) return res.status(400).json({ error: 'Unsupported platform' });
+  if (typeof handle !== 'string' || !handle.trim() || handle.length > 200) {
+    return res.status(400).json({ error: 'Missing or invalid handle' });
+  }
+  Promise.resolve(connect(handle.trim())).catch((err) => console.error(`[${platform}] connect crashed:`, err));
   res.json({ success: true });
 });
 
-app.post('/api/disconnect', (req, res) => {
-  const { auth, platform } = req.body;
-  if (auth !== DASHBOARD_PASS) return res.status(401).json({ error: 'Unauthorized' });
+app.post('/api/disconnect', requireAuth, (req, res) => {
+  const { platform } = req.body;
+  if (!PLATFORMS.includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
   disconnectPlatform(platform);
   res.json({ success: true });
 });
 
-app.get('/api/status', (req, res) => {
+app.get('/api/status', (_req, res) => {
   const summary = {};
-  Object.keys(activeAdapters).forEach((k) => {
-    summary[k] = { status: activeAdapters[k].status, handle: activeAdapters[k].handle };
+  PLATFORMS.forEach((p) => {
+    const { status, handle, error } = snapshot(p);
+    summary[p] = { status, handle, error };
   });
   res.json(summary);
 });
 
-app.get('/health', (req, res) => { res.status(200).send('OK'); });
+app.get('/health', (_req, res) => res.status(200).send('OK'));
 
 io.on('connection', (socket) => {
-  Object.keys(activeAdapters).forEach((k) => {
-    socket.emit('statusUpdate', { platform: k, status: activeAdapters[k].status, handle: activeAdapters[k].handle });
-  });
+  PLATFORMS.forEach((p) => socket.emit('statusUpdate', snapshot(p)));
 });
 
-server.listen(PORT, () => {
-  console.log(`MalikGPT Unified Chat Live on Port ${PORT}`);
-});
+// ---------------------------------------------------------------------------
+// Start / shutdown
+// ---------------------------------------------------------------------------
+server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT}`));
+
+function shutdown() {
+  console.log('Shutting down, stopping adapters...');
+  PLATFORMS.forEach((p) => disconnectPlatform(p, { silent: true }));
+  io.close();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+process.on('unhandledRejection', (err) => console.error('[Unhandled rejection]', err));
