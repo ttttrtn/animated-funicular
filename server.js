@@ -290,7 +290,7 @@ const YT_HANDLE = /^[\p{L}\p{N}._-]{3,30}$/u;
 const YT_STREAMS_TAB = 'EgdzdHJlYW1z8gYECgJ6AA%3D%3D'; // "streams" tab of a channel
 
 // Tunables (exported through _test so unit tests can shrink the timings).
-const ytCfg = { timeScale: 1, maxChatChecks: 5, maxVideoRetries: 5, fetchTimeoutMs: 10000 };
+const ytCfg = { timeScale: 1, maxChatChecks: 8, maxVideoRetries: 5, fetchTimeoutMs: 10000, maxStreams: 5, rescanMs: 90000 };
 
 // --- Errors ----------------------------------------------------------------
 const YT_PERMANENT = new Set(['NOT_FOUND', 'MEMBERS_ONLY', 'CHAT_DISABLED', 'INVALID_INPUT']);
@@ -1092,9 +1092,10 @@ async function ytApiLiveIds(channelId, signal) {
 // Staged discovery: cheap, most reliable sources first; later (heavier)
 // stages only run if earlier ones produced no verified live chat. At most
 // ytCfg.maxChatChecks chat pages are downloaded per discovery run.
-// Returns { videoId, chat } or throws YtError.
-async function ytFindLive(yt, t, signal) {
-  const tried = new Set();
+// Returns { videoId, chat } (or an array of them with {all:true}) or throws YtError.
+async function ytFindLive(yt, t, signal, { all = false, skip = null } = {}) {
+  const tried = new Set(skip || []); // streams already connected are not checked again
+  const results = [];
   let checks = 0;
   let lastErr = null;
   let blockedErr = null;
@@ -1123,7 +1124,9 @@ async function ytFindLive(yt, t, signal) {
         sawData = true;
         if (s.status === 'active') {
           console.log(`[YouTube] ${t.label}: active live chat on ${c.id} via ${c.src} (${s.chat.mode})`);
-          return { videoId: c.id, chat: s.chat };
+          if (!all) return { videoId: c.id, chat: s.chat };
+          results.push({ videoId: c.id, chat: s.chat });
+          continue;
         }
         ytMarkDead(c.id, s.code);
         if (s.code === 'MEMBERS_ONLY' || s.code === 'CHAT_DISABLED') blockedErr = ytInactiveError(s);
@@ -1165,6 +1168,7 @@ async function ytFindLive(yt, t, signal) {
     if (checks >= ytCfg.maxChatChecks) break;
   }
 
+  if (all && results.length) return results; // every verified live stream of the channel
   if (blockedErr) throw blockedErr;
   if (!sawData && lastErr) throw lastErr; // show the real reason (e.g. 403) instead of "not live"
   throw new YtError('NOT_LIVE', `${t.label} is not live right now`);
@@ -1187,8 +1191,15 @@ async function connectYouTube(input) {
   const token = Symbol('yt');
   const session = {
     ctrl: new AbortController(),
-    poller: null,
-    stop() { this.ctrl.abort(); this.poller?.stop(); }
+    streams: new Map(),   // videoId -> poller (one polling loop per live stream)
+    seen: makeSeen(3000), // shared de-duplication across all streams of this connection
+    scanTimer: null,
+    stop() {
+      this.ctrl.abort();
+      clearTimeout(this.scanTimer);
+      for (const p of this.streams.values()) p.stop();
+      this.streams.clear();
+    }
   };
   const a = activeAdapters.youtube;
   a.token = token;
@@ -1196,7 +1207,7 @@ async function connectYouTube(input) {
   const label = targets[0].label;
   console.log(`[YouTube] Connecting: ${targets.map((t) => `${t.type}:${t.value}`).join(', ')}`);
   updatePlatformStatus('youtube', 'connecting', label);
-  const ctx = { targets, token, label, session, attempt: 0, watching: targets.some((t) => t.type !== 'video') };
+  const ctx = { targets, token, label, session, attempt: 0, running: false, watching: targets.some((t) => t.type !== 'video') };
   runYouTube(ctx).catch((err) => {
     console.error('[YouTube] Unexpected failure:', err);
     if (activeAdapters.youtube.token === token) updatePlatformStatus('youtube', 'error', label, String(err?.message || err));
@@ -1207,6 +1218,16 @@ const YT_RANK = { NOT_LIVE: 6, NETWORK: 5, TIMEOUT: 5, SERVER: 5, RATE_LIMIT: 5,
 const bestYtError = (errs) => errs.slice().sort((a, b) => (YT_RANK[b.code] || 2) - (YT_RANK[a.code] || 2))[0];
 
 async function runYouTube(ctx) {
+  if (ctx.running) return; // never two discovery runs at once for one connection
+  ctx.running = true;
+  try {
+    await runYouTubeOnce(ctx);
+  } finally {
+    ctx.running = false;
+  }
+}
+
+async function runYouTubeOnce(ctx) {
   const { targets, token, label, session, watching } = ctx;
   const adapter = () => activeAdapters.youtube;
   const current = () => adapter().token === token && !session.ctrl.signal.aborted;
@@ -1249,54 +1270,87 @@ async function runYouTube(ctx) {
     return retryLater(err); // transient (network, 403, 5xx...): bounded retries
   };
 
+  // While watching a channel we keep rescanning, so streams that go live later
+  // (or a second simultaneous stream) are picked up without a reconnect.
+  const scheduleRescan = () => {
+    if (!watching || !current()) return;
+    clearTimeout(session.scanTimer);
+    session.scanTimer = setTimeout(() => {
+      runYouTube(ctx).catch((e) => console.error('[YouTube] Rescan crashed:', e));
+    }, Math.round(ytCfg.rescanMs * ytCfg.timeScale));
+  };
+
+  const announce = () => updatePlatformStatus('youtube', 'connected', session.streams.size > 1 ? `${label} (${session.streams.size} live)` : label);
+
   try {
     const yt = await getInnertubeSafe();
     if (!current()) return;
 
-    let found = null;
+    const startStream = (found) => {
+      const { videoId } = found;
+      if (session.streams.has(videoId) || session.streams.size >= ytCfg.maxStreams) return false;
+      const poller = createYtPoller({
+        chat: found.chat,
+        pollFn: makeYtPollFn(yt),
+        seen: session.seen,
+        onEntries: (msgs) => {
+          if (!current() || session.streams.get(videoId) !== poller) return; // an older connection must never broadcast
+          for (const m of msgs) {
+            try { broadcastMessage(m); } catch (err) { console.error('[YouTube] broadcast failed:', err); }
+          }
+        },
+        onEnd: ({ reason, err, definitive }) => {
+          if (session.streams.get(videoId) === poller) session.streams.delete(videoId);
+          if (definitive) ytMarkDead(videoId, 'REPLAY');
+          console.log(`[YouTube] Chat of ${videoId} stopped: ${reason}`);
+          if (!current()) return;
+          if (session.streams.size > 0) return announce(); // other streams keep running
+          clearTimeout(session.scanTimer);
+          if (watching) return retryLater(err instanceof YtError ? err : new YtError('NOT_LIVE', reason));
+          if (err) return fail(String(err?.message || err));
+          updatePlatformStatus('youtube', 'disconnected');
+        }
+      });
+      session.streams.set(videoId, poller);
+      console.log(`[YouTube] Connected to live chat of video ${videoId} (${found.chat.mode})`);
+      poller.start();
+      return true;
+    };
+
+    const rescan = session.streams.size > 0;
+    let foundList = [];
     const errs = [];
     for (const t of targets) {
       try {
-        found = t.type === 'video' ? await ytStartVideo(yt, t.value, session.ctrl.signal) : await ytFindLive(yt, t, session.ctrl.signal);
-        if (found) break;
+        if (t.type === 'video') {
+          if (rescan) continue;
+          foundList = [await ytStartVideo(yt, t.value, session.ctrl.signal)];
+        } else {
+          foundList = await ytFindLive(yt, t, session.ctrl.signal, { all: true, skip: session.streams.keys() });
+        }
+        if (foundList.length) break;
       } catch (e) {
         if (e?.code === 'ABORTED') return;
         errs.push(e instanceof YtError ? e : new YtError('NETWORK', String(e?.message || e)));
       }
     }
     if (!current()) return;
-    if (!found) return handleFailure(bestYtError(errs) || new YtError('NOT_LIVE', `${label} is not live right now`));
 
-    const seen = makeSeen(1500);
-    const poller = createYtPoller({
-      chat: found.chat,
-      pollFn: makeYtPollFn(yt),
-      seen,
-      onEntries: (msgs) => {
-        if (!current()) return; // an older connection must never broadcast
-        for (const m of msgs) {
-          try { broadcastMessage(m); } catch (err) { console.error('[YouTube] broadcast failed:', err); }
-        }
-      },
-      onEnd: ({ reason, err, definitive }) => {
-        if (!current()) return;
-        session.poller = null;
-        if (definitive) ytMarkDead(found.videoId, 'REPLAY');
-        console.log(`[YouTube] Chat of ${found.videoId} stopped: ${reason}`);
-        if (watching) return retryLater(err instanceof YtError ? err : new YtError('NOT_LIVE', reason));
-        if (err) return fail(String(err?.message || err));
-        updatePlatformStatus('youtube', 'disconnected');
-      }
-    });
-    session.poller = poller;
+    if (!foundList.length) {
+      if (rescan) return scheduleRescan(); // nothing new; existing streams keep running
+      return handleFailure(bestYtError(errs) || new YtError('NOT_LIVE', `${label} is not live right now`));
+    }
+
     ctx.attempt = 0;
-    console.log(`[YouTube] Connected to live chat of video ${found.videoId} (${found.chat.mode})`);
-    updatePlatformStatus('youtube', 'connected', label);
-    poller.start();
+    let started = 0;
+    for (const f of foundList) if (startStream(f)) started += 1;
+    if (started) announce();
+    scheduleRescan();
   } catch (err) {
     if (err?.code === 'ABORTED') return;
     console.error('[YouTube] Connect failed:', err?.message || err);
     ytClientPromise = null;
+    if (session.streams.size > 0) return scheduleRescan();
     handleFailure(err instanceof YtError ? err : new YtError('NETWORK', String(err?.message || err)));
   }
 }
@@ -1937,7 +1991,7 @@ module.exports = {
 };
 
 if (require.main === module) {
-  server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: platforms-v7]`));
+  server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: platforms-v8]`));
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
   process.on('unhandledRejection', (err) => console.error('[Unhandled rejection]', err));
