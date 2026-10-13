@@ -16,6 +16,15 @@ const io = new Server(server, { cors: { origin: '*' } });
 const PORT = process.env.PORT || 3000;
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
 
+// Behind Render's proxy req.ip would otherwise be the proxy for everybody,
+// which makes the brute-force limiter lock out all users at once.
+// TRUST_PROXY can be a hop count ("1"), or any Express trust-proxy value.
+if (process.env.TRUST_PROXY) {
+  app.set('trust proxy', /^\d+$/.test(process.env.TRUST_PROXY) ? Number(process.env.TRUST_PROXY) : process.env.TRUST_PROXY);
+} else if (process.env.RENDER) {
+  app.set('trust proxy', 1);
+}
+
 // ---------------------------------------------------------------------------
 // Auth: password from the environment only. If DASHBOARD_PASS is not set, a
 // random one is generated and printed once.
@@ -41,6 +50,12 @@ function authBlocked(ip) {
   return f.count >= AUTH_MAX_FAILS;
 }
 function authFailed(ip) {
+  if (authFails.size > 2000) {
+    // Bound memory: drop expired entries first.
+    const now = Date.now();
+    for (const [k, v] of authFails) if (now > v.resetAt) authFails.delete(k);
+    if (authFails.size > 2000) authFails.clear();
+  }
   const f = authFails.get(ip);
   if (!f || Date.now() > f.resetAt) authFails.set(ip, { count: 1, resetAt: Date.now() + AUTH_WINDOW_MS });
   else f.count += 1;
@@ -250,16 +265,178 @@ function startBridge(platform, script, arg, attempt = 0) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// 1. YouTube: @handle, channel URL/ID, or video URL/ID.
-// Handle/channel: finds the channel's current live stream, re-checks every
-// 30 s, and reconnects by itself for the next stream. Errors are retried.
-// ---------------------------------------------------------------------------
-const YT_RETRY_MS = 30000;
+// ===========================================================================
+// 1. YouTube
+//
+// Inputs: @handle, channel URL / UC id, watch / live / youtu.be URL, raw id.
+//
+// Chat transport, tried in this order (each step only runs if the previous
+// one failed for a NON-definitive reason such as 403 / consent / timeout):
+//   1. "web"       unofficial: public live_chat popout page + InnerTube
+//                  live_chat/get_live_chat polling (no API key, no quota).
+//   2. "innertube" unofficial: youtubei.js /next + get_live_chat.
+//   3. "api"       OFFICIAL: YouTube Data API v3 liveChatMessages.list, only
+//                  when YOUTUBE_API_KEY is set. Costs quota (see README note
+//                  in the deployment notes): every poll is 5 units.
+// The unofficial transports talk to undocumented endpoints. They work today
+// but can break whenever YouTube changes its pages; nothing here is a
+// guarantee. All parsing is defensive and every failure keeps its real reason.
+// ===========================================================================
+const YT_API_KEY = process.env.YOUTUBE_API_KEY || ''; // optional, official Data API v3
+const YT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const YT_VIDEO_ID = /^[\w-]{11}$/;
-let ytClientPromise = null;
+const YT_CHANNEL_ID = /^UC[\w-]{22}$/;
+const YT_HANDLE = /^[\p{L}\p{N}._-]{3,30}$/u;
+const YT_STREAMS_TAB = 'EgdzdHJlYW1z8gYECgJ6AA%3D%3D'; // "streams" tab of a channel
 
-// youtubei.js is ESM-only, so it has to be imported dynamically.
+// Tunables (exported through _test so unit tests can shrink the timings).
+const ytCfg = { timeScale: 1, maxChatChecks: 5, maxVideoRetries: 5, fetchTimeoutMs: 10000 };
+
+// --- Errors ----------------------------------------------------------------
+const YT_PERMANENT = new Set(['NOT_FOUND', 'MEMBERS_ONLY', 'CHAT_DISABLED', 'INVALID_INPUT']);
+
+class YtError extends Error {
+  constructor(code, message, extra = {}) {
+    super(message);
+    this.name = 'YtError';
+    this.code = code;
+    Object.assign(this, extra);
+  }
+  get permanent() { return YT_PERMANENT.has(this.code); }
+}
+
+function ytHttpError(status, what = 'request') {
+  const s = Number(status) || 0;
+  if (s === 429) return new YtError('RATE_LIMIT', `YouTube rate-limited the ${what} (HTTP 429)`, { status: s });
+  if (s === 401 || s === 403) return new YtError('FORBIDDEN', `YouTube refused the ${what} (HTTP ${s}); this server's IP may be blocked`, { status: s });
+  if (s === 404 || s === 410) return new YtError('NOT_FOUND', `${what} not found (HTTP ${s})`, { status: s });
+  if (s >= 500) return new YtError('SERVER', `YouTube server error on ${what} (HTTP ${s})`, { status: s });
+  return new YtError('HTTP', `${what} failed (HTTP ${s})`, { status: s });
+}
+
+// --- Input parsing ----------------------------------------------------------
+const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+
+function youTubeTargets(input) {
+  const s = String(input || '').trim().slice(0, 300);
+  const handle = (h) => ({ type: 'handle', value: h, label: `@${h}` });
+  const video = (v) => ({ type: 'video', value: v, label: v });
+  const channel = (c) => ({ type: 'channel', value: c, label: c });
+  if (!s) return [];
+
+  if (/^https?:\/\//i.test(s) || /^(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)\//i.test(s)) {
+    let u;
+    try { u = new URL(/^https?:/i.test(s) ? s : `https://${s}`); } catch { return []; }
+    const host = u.hostname.toLowerCase().replace(/^(?:www\.|m\.|music\.)/, '');
+    if (host === 'youtu.be') {
+      const id = u.pathname.slice(1).split('/')[0];
+      return YT_VIDEO_ID.test(id) ? [video(id)] : [];
+    }
+    if (host !== 'youtube.com') return [];
+    const v = u.searchParams.get('v');
+    if (v && YT_VIDEO_ID.test(v)) return [video(v)];
+    let m = u.pathname.match(/^\/(?:live|embed|shorts)\/([\w-]{11})(?:[/?#]|$)/);
+    if (m) return [video(m[1])];
+    m = u.pathname.match(/^\/@([^/]+)/);
+    if (m) { const h = safeDecode(m[1]); return YT_HANDLE.test(h) ? [handle(h)] : []; }
+    m = u.pathname.match(/^\/channel\/(UC[\w-]{22})(?:[/?#]|$)/);
+    if (m) return [channel(m[1])];
+    // Legacy /c/Name and /user/Name URLs: best effort, treated as a handle.
+    m = u.pathname.match(/^\/(?:c|user)\/([^/]+)/);
+    if (m) { const h = safeDecode(m[1]); return YT_HANDLE.test(h) ? [handle(h)] : []; }
+    return [];
+  }
+
+  if (s.startsWith('@')) return YT_HANDLE.test(s.slice(1)) ? [handle(s.slice(1))] : [];
+  if (YT_CHANNEL_ID.test(s)) return [channel(s)];
+  if (YT_VIDEO_ID.test(s)) {
+    // 11 chars can be a video ID or a short handle. Real IDs usually contain A-Z, "-" or "_".
+    return /[A-Z_-]/.test(s) ? [video(s), handle(s)] : [handle(s), video(s)];
+  }
+  if (YT_HANDLE.test(s)) return [handle(s)];
+  return [];
+}
+
+// --- HTTP -------------------------------------------------------------------
+const ytWebHeaders = (extra = {}) => ({
+  'User-Agent': YT_UA,
+  'Accept-Language': 'en-US,en;q=0.9',
+  Cookie: 'SOCS=CAI; CONSENT=YES+1',
+  ...extra
+});
+
+async function ytReadCapped(res, maxBytes) {
+  if (!res.body || typeof res.body.getReader !== 'function') return (await res.text()).slice(0, maxBytes);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.length;
+    chunks.push(Buffer.from(value));
+    if (n > maxBytes) { try { await reader.cancel(); } catch {} break; }
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+// fetch with timeout (covers the body read), size cap and external abort.
+// Never throws anything but YtError.
+async function ytFetch(url, { method = 'GET', headers = {}, body, timeout = ytCfg.fetchTimeoutMs, maxBytes = 4_000_000, signal } = {}) {
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeout);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    const res = await fetch(url, { method, headers, body, signal: ctrl.signal });
+    const text = await ytReadCapped(res, maxBytes);
+    return { status: res.status, url: res.url || url, text };
+  } catch (err) {
+    if (signal?.aborted) throw new YtError('ABORTED', 'aborted');
+    if (timedOut) throw new YtError('TIMEOUT', `YouTube request timed out after ${timeout} ms`);
+    if (err instanceof YtError) throw err;
+    throw new YtError('NETWORK', `Network error: ${err?.cause?.code || err?.message || err}`);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+// Race a non-abortable promise (youtubei.js calls) against an abort signal.
+function ytAbortable(promise, signal) {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(new YtError('ABORTED', 'aborted'));
+    const onAbort = () => reject(new YtError('ABORTED', 'aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      (e) => { signal.removeEventListener('abort', onAbort); reject(e); }
+    );
+  });
+}
+
+// Wraps youtubei.js errors so they carry a code (HTTP status when present).
+async function ytLib(fn, signal) {
+  try {
+    return await ytAbortable(Promise.resolve().then(fn), signal);
+  } catch (err) {
+    if (err instanceof YtError) throw err;
+    const msg = String(err?.message || err);
+    const status = msg.match(/\b(401|403|404|429|5\d\d)\b/)?.[1];
+    if (status) { const e = ytHttpError(status, 'youtubei.js request'); e.message += ` (${msg.slice(0, 120)})`; throw e; }
+    throw new YtError('NETWORK', `youtubei.js: ${msg.slice(0, 200)}`);
+  }
+}
+
+// youtubei.js is ESM-only, so it has to be imported dynamically. It is an
+// OPTIONAL helper: if it is missing or fails to initialise the server still
+// works through the plain-HTTP transports.
+let ytClientPromise = null;
 function getInnertube(fresh = false) {
   if (fresh) ytClientPromise = null;
   if (!ytClientPromise) {
@@ -272,459 +449,855 @@ function getInnertube(fresh = false) {
   }
   return ytClientPromise;
 }
-
-const codeErr = (code, message) => Object.assign(new Error(message), { code });
-
-function youTubeTargets(input) {
-  const s = String(input || '').trim();
-  const handle = (h) => ({ type: 'handle', value: h, label: `@${h}` });
-  const video = (v) => ({ type: 'video', value: v, label: v });
-  const channel = (c) => ({ type: 'channel', value: c, label: c });
-  if (!s) return [];
-
-  if (/^https?:\/\//i.test(s) || /^(www\.|m\.)?(youtube\.com|youtu\.be)\//i.test(s)) {
-    let u;
-    try { u = new URL(/^https?:/i.test(s) ? s : `https://${s}`); } catch { return []; }
-    const host = u.hostname.replace(/^(www\.|m\.)/, '');
-    if (host === 'youtu.be') {
-      const id = u.pathname.slice(1).split('/')[0];
-      return YT_VIDEO_ID.test(id) ? [video(id)] : [];
-    }
-    if (!host.endsWith('youtube.com')) return [];
-    const v = u.searchParams.get('v');
-    if (v && YT_VIDEO_ID.test(v)) return [video(v)];
-    let m = u.pathname.match(/^\/(?:live|embed|shorts)\/([\w-]{11})/);
-    if (m) return [video(m[1])];
-    m = u.pathname.match(/^\/@([\w.-]+)/);
-    if (m) return [handle(m[1])];
-    m = u.pathname.match(/^\/channel\/(UC[\w-]{22})/);
-    if (m) return [channel(m[1])];
-    return [];
-  }
-
-  if (s.startsWith('@')) return /^@[\w.-]{3,30}$/.test(s) ? [handle(s.slice(1))] : [];
-  if (/^UC[\w-]{22}$/.test(s)) return [channel(s)];
-  if (YT_VIDEO_ID.test(s)) {
-    // 11 chars can be a video ID or a short handle. Real IDs usually contain A-Z, "-" or "_".
-    return /[A-Z_-]/.test(s) ? [video(s), handle(s)] : [handle(s), video(s)];
-  }
-  if (/^[\w.-]{3,30}$/.test(s)) return [handle(s)];
-  return [];
-}
-
-const ytFetchPage = async (url) => {
-  const res = await fetch(url, {
-    headers: {
-      'Accept-Language': 'en-US,en;q=0.9',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-      Cookie: 'SOCS=CAI; CONSENT=YES+1'
-    },
-    signal: AbortSignal.timeout(10000)
-  });
-  return { status: res.status, url: res.url || url, html: await res.text() };
-};
-const ytFetchHtml = async (url) => (await ytFetchPage(url)).html;
-
-async function channelIdFromHandle(yt, handle) {
+let ytLibWarnAt = 0;
+async function getInnertubeSafe() {
   try {
-    const ep = await yt.resolveURL(`https://www.youtube.com/@${handle}`);
-    const id = ep?.payload?.browseId;
-    if (id) return id;
-  } catch {}
-  try {
-    const html = await ytFetchHtml(`https://www.youtube.com/@${handle}`);
-    const m = html.match(/"(?:channelId|externalId|browseId)":"(UC[\w-]{22})"/);
-    if (m) return m[1];
-  } catch {}
-  return null;
-}
-
-function pickLiveVideoId(videos) {
-  for (const v of videos || []) {
-    const id = v?.video_id || v?.id || v?.content_id;
-    if (!YT_VIDEO_ID.test(String(id))) continue;
-    const badgeLive = (v?.badges || []).some?.((b) => /LIVE_NOW/i.test(String(b?.style || b?.label || '')));
-    if (v?.is_live === true || badgeLive) return id;
-  }
-  return null;
-}
-
-// <channel>/live redirects to the current stream when there is one.
-async function liveIdFromLivePage(pathPart) {
-  try {
-    const p = await ytFetchPage(`https://www.youtube.com/${pathPart}/live`);
-    const fromUrl = p.url.match(/[?&]v=([\w-]{11})/);
-    const fromCanon = p.html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/);
-    let id = fromUrl?.[1] || fromCanon?.[1] || null;
-    if (!id) {
-      // Watch-page data embedded in the HTML: videoDetails followed by isLive:true.
-      const i = p.html.indexOf('"videoDetails":{"videoId":"');
-      if (i !== -1) {
-        const chunk = p.html.slice(i, i + 4000);
-        const m = chunk.match(/"videoId":"([\w-]{11})"/);
-        if (m && /"isLive":true/.test(chunk)) id = m[1];
-      }
-    }
-    const wall = /consent\.youtube\.com/.test(p.url) ? ' (CONSENT WALL)' : '';
-    console.log(`[YouTube] /live page ${pathPart}: HTTP ${p.status}, ${p.html.length} bytes, final URL ${p.url.slice(0, 90)}, video ${id || 'none'}${wall}`);
-    return id;
+    return await getInnertube();
   } catch (err) {
-    console.error(`[YouTube] /live page ${pathPart} failed:`, err?.message || err);
+    if (Date.now() - ytLibWarnAt > 10 * 60000) { // warn once per 10 min, not on every retry
+      ytLibWarnAt = Date.now();
+      console.warn(`[YouTube] youtubei.js unavailable, continuing without it: ${err?.message || err}`);
+    }
     return null;
   }
 }
 
-// RSS feed lists a channel's newest uploads and streams (no Innertube parsing).
-async function ytFeedVideoIds(channelId) {
-  try {
-    const res = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(10000)
-    });
-    const xml = await res.text();
-    const ids = [...xml.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)].map((m) => m[1]).slice(0, 6);
-    console.log(`[YouTube] RSS feed ${channelId}: HTTP ${res.status}, ${ids.length} video(s)`);
-    return res.ok ? ids : [];
-  } catch (err) {
-    console.error('[YouTube] RSS feed failed:', err?.message || err);
-    return [];
+// --- Small caches -----------------------------------------------------------
+const ytChannelCache = new Map(); // lowercase handle -> { id, exp }
+const ytDeadVideos = new Map();   // videoId -> expiry (known ended / not a livestream)
+
+function ytMarkDead(id, code) {
+  const ttl = code === 'REPLAY' ? 30 * 60000 : code === 'NO_CHAT' || code === 'NOT_FOUND' ? 10 * 60000 : 0;
+  if (!ttl) return;
+  if (ytDeadVideos.size > 300) {
+    const now = Date.now();
+    for (const [k, v] of ytDeadVideos) if (v < now) ytDeadVideos.delete(k);
+    if (ytDeadVideos.size > 300) ytDeadVideos.delete(ytDeadVideos.keys().next().value);
   }
+  ytDeadVideos.set(id, Date.now() + ttl * ytCfg.timeScale);
+}
+function ytIsDead(id) {
+  const exp = ytDeadVideos.get(id);
+  if (!exp) return false;
+  if (exp < Date.now()) { ytDeadVideos.delete(id); return false; }
+  return true;
 }
 
-const YT_STREAMS_TAB = 'EgdzdHJlYW1z8gYECgJ6AA%3D%3D'; // "streams" tab of a channel
-const YT_API_KEY = process.env.YOUTUBE_API_KEY; // optional, official Data API v3
+// --- Generic JSON helpers ----------------------------------------------------
+// Extracts the first balanced {...} object starting at s[start].
+function ytBalancedObject(s, start) {
+  if (s[start] !== '{') return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  const end = Math.min(s.length, start + 3_000_000);
+  for (let i = start; i < end; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return s.slice(start, i + 1);
+  }
+  return null;
+}
 
-// Raw browse of the channel's Streams tab. Regexes the JSON instead of relying
-// on the library's parser classes, which break whenever YouTube changes layout.
-async function ytStreamsTabIds(yt, channelId) {
-  try {
-    const res = await yt.actions.execute('/browse', { browseId: channelId, params: YT_STREAMS_TAB });
-    const json = JSON.stringify(res?.data || res || {});
-    const live = [];
-    const rest = [];
-    const seen = new Set();
-    for (const m of json.matchAll(/"videoId":"([\w-]{11})"/g)) {
-      if (seen.has(m[1])) continue;
-      seen.add(m[1]);
-      const near = json.slice(m.index, m.index + 3000);
-      (/BADGE_STYLE_TYPE_LIVE_NOW|"style":"LIVE"|LIVE_NOW/.test(near) ? live : rest).push(m[1]);
+// Finds `ytInitialData = {...}` in any of the forms YouTube has used.
+function ytExtractInitialData(html) {
+  if (typeof html !== 'string') return null;
+  for (const marker of ['window["ytInitialData"]', 'var ytInitialData', 'ytInitialData']) {
+    let from = 0;
+    for (;;) {
+      const i = html.indexOf(marker, from);
+      if (i === -1) break;
+      from = i + marker.length;
+      const eq = html.slice(from, from + 8).match(/^\s*=\s*/);
+      if (!eq) continue;
+      const json = ytBalancedObject(html, from + eq[0].length);
+      if (!json) continue;
+      try { return JSON.parse(json); } catch { /* try next occurrence */ }
     }
-    console.log(`[YouTube] Raw streams tab ${channelId}: ${json.length} bytes, ${seen.size} video id(s), ${live.length} flagged live`);
-    return [...live, ...rest].slice(0, 8);
-  } catch (err) {
-    console.error('[YouTube] Raw streams tab failed:', err?.message || err);
-    return [];
   }
+  return null;
 }
 
-// Optional: official API (set env YOUTUBE_API_KEY). 2 quota units per check.
-async function ytApiLiveIds(channelId) {
-  if (!YT_API_KEY || !/^UC/.test(channelId)) return [];
-  const get = async (url) => {
-    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(`YouTube API ${r.status}: ${j?.error?.message || 'error'}`);
-    return j;
-  };
-  try {
-    const pl = await get(`https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=8&playlistId=UU${channelId.slice(2)}&key=${YT_API_KEY}`);
-    const ids = (pl.items || []).map((i) => i.contentDetails?.videoId).filter(Boolean);
-    if (!ids.length) return [];
-    const v = await get(`https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${ids.join(',')}&key=${YT_API_KEY}`);
-    const live = (v.items || []).filter((x) => x.snippet?.liveBroadcastContent === 'live').map((x) => x.id);
-    console.log(`[YouTube] Data API ${channelId}: ${ids.length} recent upload(s), ${live.length} live`);
-    return live;
-  } catch (err) {
-    console.error('[YouTube] Data API failed:', err?.message || err);
-    return [];
+const ytCfgValue = (html, name) => html.match(new RegExp(`"${name}"\\s*:\\s*"([^"]+)"`))?.[1] || '';
+
+// Walks a JSON tree (iteratively, with a node cap) and collects objects for
+// which `pick(node)` returns a value.
+function ytWalk(root, pick, cap = 60000) {
+  const out = [];
+  const stack = [root];
+  let n = 0;
+  while (stack.length && n++ < cap) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') continue;
+    if (Array.isArray(node)) { for (let i = node.length - 1; i >= 0; i--) stack.push(node[i]); continue; }
+    const hit = pick(node);
+    if (hit) out.push(hit);
+    for (const k of Object.keys(node)) stack.push(node[k]);
   }
+  return out;
 }
 
-// Collects candidate video IDs from several sources, then keeps the first one
-// that really has an ACTIVE live chat (ended streams only have a replay chat).
-async function findLiveVideoId(yt, t) {
-  const candidates = [];
-  const add = (id, src) => { if (id && YT_VIDEO_ID.test(id) && !candidates.some((c) => c.id === id)) candidates.push({ id, src }); };
+// --- Continuations ----------------------------------------------------------
+// Continuation data can sit in several shapes. Prefer the live-polling kinds;
+// "reload" is a last resort; the replay kind means the stream is over.
+const YT_CONT_KINDS = ['invalidationContinuationData', 'timedContinuationData', 'reloadContinuationData', 'liveChatReplayContinuationData'];
 
-  let channelId = t.type === 'handle' ? await channelIdFromHandle(yt, t.value) : t.value;
-  console.log(`[YouTube] ${t.label}: channel id ${channelId || 'NOT RESOLVED'}`);
-
-  // 1. The channel's /live page redirects to the current stream.
-  add(await liveIdFromLivePage(t.type === 'handle' ? `@${t.value}` : `channel/${t.value}`), '/live page');
-
-  if (!channelId && !candidates.length) throw codeErr('NOT_FOUND', `YouTube channel ${t.label} not found`);
-
-  if (channelId) {
-    for (const id of await ytApiLiveIds(channelId)) add(id, 'Data API');
-    for (const id of await ytStreamsTabIds(yt, channelId)) add(id, 'raw streams tab');
-    // 2. Innertube channel tabs.
-    try {
-      const channel = await yt.getChannel(channelId);
-      if (channel.has_live_streams) {
-        const vids = (await channel.getLiveStreams()).videos || [];
-        console.log(`[YouTube] Innertube live tab: ${vids.length} item(s)`);
-        add(pickLiveVideoId(vids), 'Innertube streams tab (live badge)');
-        vids.slice(0, 5).forEach((v) => add(v?.video_id || v?.id || v?.content_id, 'Innertube streams tab'));
+function ytExtractContinuation(conts) {
+  if (!Array.isArray(conts)) return null;
+  for (const kind of YT_CONT_KINDS) {
+    for (const c of conts) {
+      const d = c?.[kind];
+      if (d && typeof d.continuation === 'string' && d.continuation) {
+        return { token: d.continuation, wait: Number(d.timeoutMs) || 0, kind };
       }
-      add(pickLiveVideoId(channel.videos), 'Innertube home');
-      console.log(`[YouTube] Innertube channel ${channelId}: live tab ${channel.has_live_streams ? 'yes' : 'no'}, home items ${(channel.videos || []).length}`);
-    } catch (err) {
-      console.error('[YouTube] Channel lookup failed:', err?.message || err);
-    }
-    // 3. RSS feed: newest uploads/streams.
-    for (const id of await ytFeedVideoIds(channelId)) add(id, 'RSS feed');
-  }
-
-  console.log(`[YouTube] ${t.label}: ${candidates.length} candidate(s): ${candidates.map((c) => `${c.id} (${c.src})`).join(', ') || 'none'}`);
-
-  let lastErr = null;
-  for (const c of candidates) {
-    try {
-      if (await ytChatStart(yt, c.id)) {
-        console.log(`[YouTube] ${t.label}: live chat found on ${c.id} via ${c.src}`);
-        return c.id;
-      }
-    } catch (e) {
-      lastErr = e;
-      console.error(`[YouTube] Chat check failed for ${c.id}:`, e?.message || e);
     }
   }
-  if (lastErr) throw lastErr; // show the real error (e.g. 403) instead of "not live"
-  throw codeErr('NOT_LIVE', `${t.label} is not live right now`);
+  return null;
 }
 
-// --- Chat parsing (raw InnerTube JSON; avoids the /player endpoint, which
-// YouTube blocks with 403 for many server IPs) -------------------------------
-const ytText = (t) => {
+function ytFindLiveChatRenderer(data) {
+  const direct = data?.contents?.liveChatRenderer
+    || data?.contents?.twoColumnWatchNextResults?.conversationBar?.liveChatRenderer;
+  if (direct) return direct;
+  const found = ytWalk(data?.contents, (n) => n.liveChatRenderer, 20000);
+  return found[0] || null;
+}
+
+// --- Chat item parsing ------------------------------------------------------
+function ytText(t) {
   if (!t) return '';
-  if (t.simpleText) return t.simpleText;
-  return (t.runs || []).map((r) => r.text ?? r.emoji?.shortcuts?.[0] ?? r.emoji?.emojiId ?? '').join('');
-};
+  if (typeof t === 'string') return t;
+  if (typeof t.simpleText === 'string') return t.simpleText;
+  if (!Array.isArray(t.runs)) return '';
+  return t.runs
+    .map((r) => {
+      if (typeof r?.text === 'string') return r.text;
+      const e = r?.emoji;
+      if (!e) return '';
+      if (e.isCustomEmoji) return e.shortcuts?.[0] || e.image?.accessibility?.accessibilityData?.label || '';
+      return e.emojiId || e.shortcuts?.[0] || '';
+    })
+    .join('');
+}
 
-function ytBadges(r) {
-  return (r.authorBadges || [])
+function ytAvatar(photo) {
+  const u = photo?.thumbnails?.[0]?.url;
+  if (typeof u !== 'string') return '';
+  return u.startsWith('//') ? `https:${u}` : u;
+}
+
+function ytBadges(list) {
+  if (!Array.isArray(list)) return [];
+  return list
     .map((b) => b?.liveChatAuthorBadgeRenderer)
     .filter(Boolean)
     .map((b) => {
-      const icon = String(b.icon?.iconType || '').toLowerCase(); // owner | moderator | verified
-      const url = b.customThumbnail?.thumbnails?.slice(-1)[0]?.url || ''; // channel member badge image
+      const icon = String(b.icon?.iconType || '').toLowerCase(); // owner | moderator | verified | verified_artist
+      const thumbs = b.customThumbnail?.thumbnails;
+      const url = Array.isArray(thumbs) && thumbs.length ? thumbs[thumbs.length - 1]?.url || '' : ''; // member badge image
       return { type: icon || (url ? 'member' : 'badge'), label: b.tooltip || icon || 'Member', url };
     });
 }
 
-function ytItemToMessage(item, isSeen) {
-  const paid = Boolean(item?.liveChatPaidMessageRenderer);
-  const r = item?.liveChatTextMessageRenderer || item?.liveChatPaidMessageRenderer;
-  if (!r) return null;
+// One chat item -> { key, message } or null. Returns null for item types
+// that are not chat messages (banners, placeholders, viewer engagement...).
+function ytItemToEntry(item) {
+  if (!item || typeof item !== 'object') return null;
+  let r;
+  let text = '';
+  let author = '';
+  let photo;
+  let badgeList;
 
-  const id = r.id ? `youtube-${r.id}` : null;
-  if (id && isSeen(id)) return null;
+  if ((r = item.liveChatTextMessageRenderer)) {
+    text = ytText(r.message);
+    if (!text) return null;
+  } else if ((r = item.liveChatPaidMessageRenderer)) {
+    text = `\u{1F4B0} ${ytText(r.purchaseAmountText)} ${ytText(r.message)}`.trim();
+  } else if ((r = item.liveChatPaidStickerRenderer)) {
+    text = `\u{1F4B0} ${ytText(r.purchaseAmountText)} [Super Sticker]`.trim();
+  } else if ((r = item.liveChatMembershipItemRenderer)) {
+    const head = ytText(r.headerSubtext) || ytText(r.headerPrimaryText) || 'New member';
+    text = `\u2B50 ${head} ${ytText(r.message)}`.trim();
+  } else if ((r = item.liveChatSponsorshipsGiftPurchaseAnnouncementRenderer)) {
+    const h = r.header?.liveChatSponsorshipsHeaderRenderer || {};
+    text = `\u{1F381} ${ytText(h.primaryText) || 'Gifted memberships'}`.trim();
+    author = ytText(h.authorName);
+    photo = h.authorPhoto;
+    badgeList = h.authorBadges;
+  } else if ((r = item.liveChatSponsorshipsGiftRedemptionAnnouncementRenderer)) {
+    text = `\u{1F381} ${ytText(r.message) || 'Received a gifted membership'}`.trim();
+  } else {
+    return null;
+  }
 
-  let text = ytText(r.message);
-  if (paid) text = `\u{1F4B0} ${ytText(r.purchaseAmountText)} ${text}`.trim();
-  if (!text) return null;
-
-  return normalizeMessage('youtube', ytText(r.authorName) || 'Viewer', text, r.authorPhoto?.thumbnails?.[0]?.url || '', id, ytBadges(r));
+  author = author || ytText(r.authorName) || 'Viewer';
+  photo = photo || r.authorPhoto;
+  badgeList = badgeList || r.authorBadges;
+  const key = r.id
+    ? `youtube-${r.id}`
+    : `youtube-${author}-${r.timestampUsec || ''}-${crypto.createHash('sha1').update(text).digest('hex').slice(0, 10)}`;
+  return { key, message: normalizeMessage('youtube', author, text, ytAvatar(photo), key, ytBadges(badgeList)) };
 }
 
-function ytNextContinuation(conts) {
-  const c = conts?.[0];
-  const d = c?.invalidationContinuationData || c?.timedContinuationData || c?.reloadContinuationData;
-  return d?.continuation ? { token: d.continuation, wait: d.timeoutMs } : null;
+function ytActionsToEntries(actions) {
+  const out = [];
+  if (!Array.isArray(actions)) return out;
+  for (const a of actions) {
+    const item = a?.addChatItemAction?.item
+      || a?.replayChatItemAction?.actions?.find?.((x) => x?.addChatItemAction)?.addChatItemAction?.item;
+    if (!item) continue;
+    try {
+      const e = ytItemToEntry(item);
+      if (e) out.push(e);
+    } catch (err) {
+      console.error('[YouTube] Could not parse a chat item:', err?.message || err);
+    }
+  }
+  return out;
 }
 
-const YT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-
-// Primary method: the public chat popout page (same one used by the chat
-// popout in the browser). It does not use /next or /player, which YouTube
-// blocks with 403 for many server IPs. Returns null if there is no ACTIVE chat.
-async function ytPopoutStart(videoId) {
-  const p = await ytFetchPage(`https://www.youtube.com/live_chat?is_popout=1&v=${videoId}`);
-  if (p.status !== 200) throw new Error(`live_chat page HTTP ${p.status}`);
-  const m = p.html.match(/(?:window\["ytInitialData"\]|var ytInitialData)\s*=\s*(\{.+?\});\s*<\/script>/s);
-  if (!m) throw new Error('live_chat page had no chat data (consent or blocked page?)');
-  let data;
-  try { data = JSON.parse(m[1]); } catch { throw new Error('live_chat data unreadable'); }
-  const lc = data?.contents?.liveChatRenderer;
-  if (!lc || lc.isReplay) return null;
-  const next = ytNextContinuation(lc.continuations);
-  if (!next) return null;
-  const apiKey = p.html.match(/"INNERTUBE_API_KEY":"([\w-]+)"/)?.[1];
-  const clientVersion =
-    p.html.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION":"([\d.]+)"/)?.[1] || p.html.match(/"clientVersion":"([\d.]+)"/)?.[1];
-  if (!apiKey || !clientVersion) throw new Error('live_chat page missing API key or client version');
-  return { mode: 'popout', next, apiKey, clientVersion };
+// Parses a get_live_chat response. Throws YtError for error payloads.
+function ytParseChatResponse(data) {
+  if (!data || typeof data !== 'object') throw new YtError('PARSE', 'get_live_chat returned an unexpected payload');
+  if (data.error) {
+    const e = ytHttpError(Number(data.error.code) || 0, 'get_live_chat');
+    if (data.error.message) e.message += `: ${String(data.error.message).slice(0, 120)}`;
+    throw e;
+  }
+  const lcc = data.continuationContents?.liveChatContinuation;
+  if (!lcc) return { entries: [], next: null, ended: false, reason: 'no liveChatContinuation' };
+  const entries = ytActionsToEntries(lcc.actions);
+  const next = ytExtractContinuation(lcc.continuations);
+  if (next?.kind === 'liveChatReplayContinuationData') return { entries, next: null, ended: true, reason: 'replay' };
+  return { entries, next, ended: false };
 }
 
-// Fallback: Innertube /next (blocked with 403 on some hosts).
-async function ytNextStart(yt, videoId) {
-  const res = await yt.actions.execute('/next', { videoId });
+// --- Chat start: popout page ------------------------------------------------
+const inactive = (code, reason) => ({ status: 'inactive', code, reason });
+
+function ytInactiveFromData(data) {
+  let blob = '';
+  try { blob = JSON.stringify(data?.contents || {}).slice(0, 30000); } catch {}
+  if (/members[- ]only|only (?:available to|for) (?:channel )?members/i.test(blob)) return inactive('MEMBERS_ONLY', 'chat is members-only');
+  if (/chat is disabled|chat has been (?:turned off|disabled)|chat is turned off|live chat is disabled/i.test(blob)) return inactive('CHAT_DISABLED', 'chat is disabled for this stream');
+  if (/video unavailable|private video|has been removed/i.test(blob)) return inactive('NOT_FOUND', 'video unavailable');
+  return inactive('NO_CHAT', 'no live chat on this video');
+}
+
+// Pure function (easy to unit test): page response -> active/inactive, or throws YtError.
+function ytAnalyzeChatPage(page) {
+  const { status, url, text } = page;
+  const consent = () => new YtError('CONSENT', 'YouTube served a cookie-consent page instead of the chat');
+  if (/consent\.(?:youtube|google)\.com/i.test(url || '')) throw consent();
+  if (status === 404 || status === 410) return inactive('NOT_FOUND', 'video not found');
+  if (status !== 200) throw ytHttpError(status, 'live chat page');
+
+  const data = ytExtractInitialData(text);
+  if (!data) {
+    if (/action="https:\/\/consent\.youtube\.com|Before you continue to YouTube/i.test(text || '')) throw consent();
+    throw new YtError('BAD_RESPONSE', 'live chat page had no chat data (layout changed or blocked page)');
+  }
+  const lc = ytFindLiveChatRenderer(data);
+  if (!lc) return ytInactiveFromData(data);
+  if (lc.isReplay) return inactive('REPLAY', 'only a chat replay (stream ended)');
+  const next = ytExtractContinuation(lc.continuations);
+  if (!next) return inactive('NO_CHAT', 'chat has no continuation (ended or unavailable)');
+  if (next.kind === 'liveChatReplayContinuationData') return inactive('REPLAY', 'only a chat replay (stream ended)');
+
+  const apiKey = ytCfgValue(text, 'INNERTUBE_API_KEY');
+  const clientVersion = ytCfgValue(text, 'INNERTUBE_CONTEXT_CLIENT_VERSION') || ytCfgValue(text, 'clientVersion');
+  if (!apiKey || !clientVersion) throw new YtError('BAD_RESPONSE', 'live chat page is missing the InnerTube key or client version');
+  const visitorData = ytCfgValue(text, 'visitorData') || ytCfgValue(text, 'VISITOR_DATA');
+
+  return {
+    status: 'active',
+    chat: {
+      mode: 'web',
+      next,
+      apiKey,
+      clientVersion,
+      visitorData,
+      seedKeys: ytActionsToEntries(lc.actions).map((e) => e.key)
+    }
+  };
+}
+
+async function ytPopoutStart(videoId, signal) {
+  const page = await ytFetch(`https://www.youtube.com/live_chat?is_popout=1&v=${encodeURIComponent(videoId)}`, {
+    headers: ytWebHeaders(),
+    signal
+  });
+  return ytAnalyzeChatPage(page);
+}
+
+// --- Chat start: youtubei.js fallback ---------------------------------------
+async function ytNextStart(yt, videoId, signal) {
+  const res = await ytLib(() => yt.actions.execute('/next', { videoId }), signal);
   const data = res?.data || res;
-  const lc = data?.contents?.twoColumnWatchNextResults?.conversationBar?.liveChatRenderer;
-  if (!lc || lc.isReplay) return null;
-  const next = ytNextContinuation(lc.continuations);
-  return next ? { mode: 'innertube', next } : null;
+  const lc = ytFindLiveChatRenderer(data);
+  if (!lc) return inactive('NO_CHAT', 'no live chat on this video');
+  if (lc.isReplay) return inactive('REPLAY', 'only a chat replay (stream ended)');
+  const next = ytExtractContinuation(lc.continuations);
+  if (!next || next.kind === 'liveChatReplayContinuationData') return inactive('NO_CHAT', 'chat has no continuation');
+  return { status: 'active', chat: { mode: 'innertube', next, seedKeys: ytActionsToEntries(lc.actions).map((e) => e.key) } };
 }
 
-// Returns { mode, next, ... } for an active chat, or null if none.
-async function ytChatStart(yt, videoId) {
-  let popErr = null;
-  try {
-    return await ytPopoutStart(videoId);
-  } catch (e) {
-    popErr = e;
-    console.error(`[YouTube] Popout chat page failed for ${videoId}:`, e?.message || e);
+// --- Official Data API (optional) -------------------------------------------
+async function ytApiJson(url, signal) {
+  const r = await ytFetch(url, { headers: { 'X-Goog-Api-Key': YT_API_KEY, Accept: 'application/json' }, signal, maxBytes: 2_000_000 });
+  let j = {};
+  try { j = JSON.parse(r.text); } catch { /* keep {} */ }
+  if (r.status >= 400) {
+    const reason = String(j?.error?.errors?.[0]?.reason || '');
+    let code = 'HTTP';
+    if (r.status === 429) code = 'RATE_LIMIT';
+    else if (r.status === 403) code = /liveChatEnded/i.test(reason) ? 'ENDED' : /liveChatDisabled/i.test(reason) ? 'CHAT_DISABLED' : /quota|rateLimit|dailyLimit/i.test(reason) ? 'RATE_LIMIT' : 'FORBIDDEN';
+    else if (r.status === 404) code = 'NOT_FOUND';
+    else if (r.status >= 500) code = 'SERVER';
+    throw new YtError(code, `YouTube API ${r.status}${reason ? ` (${reason})` : ''}: ${String(j?.error?.message || 'error').slice(0, 150)}`, { status: r.status });
   }
-  try {
-    return await ytNextStart(yt, videoId);
-  } catch (e) {
-    throw new Error(`${popErr.message} | fallback: ${e?.message || e}`);
-  }
+  return j;
 }
 
-async function ytChatPoll(yt, chat) {
-  if (chat.mode === 'popout') {
-    const r = await fetch(`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${chat.apiKey}&prettyPrint=false`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': YT_UA,
-        Origin: 'https://www.youtube.com',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Cookie: 'SOCS=CAI; CONSENT=YES+1'
-      },
-      body: JSON.stringify({
-        context: { client: { clientName: 'WEB', clientVersion: chat.clientVersion, hl: 'en', gl: 'US' } },
-        continuation: chat.next.token
-      }),
-      signal: AbortSignal.timeout(10000)
-    });
-    if (!r.ok) throw new Error(`get_live_chat HTTP ${r.status}`);
-    return r.json();
+async function ytApiStart(videoId, signal) {
+  const j = await ytApiJson(`https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${encodeURIComponent(videoId)}`, signal);
+  const v = j.items?.[0];
+  if (!v) return inactive('NOT_FOUND', 'video not found');
+  const liveChatId = v.liveStreamingDetails?.activeLiveChatId;
+  if (v.snippet?.liveBroadcastContent !== 'live' || !liveChatId) {
+    return inactive(v.liveStreamingDetails?.actualEndTime ? 'REPLAY' : 'NO_CHAT', 'video is not live or has no active chat');
   }
-  const res = await yt.actions.execute('/live_chat/get_live_chat', { continuation: chat.next.token });
-  return res?.data || res;
+  return { status: 'active', chat: { mode: 'api', liveChatId, next: { token: '', wait: 5000, kind: 'api' }, minWait: 5000, maxWait: 30000, seedKeys: [] } };
 }
 
+function ytApiItemToEntry(it) {
+  const sn = it?.snippet;
+  const au = it?.authorDetails || {};
+  if (!sn || !it.id) return null;
+  let text = '';
+  switch (sn.type) {
+    case 'textMessageEvent': text = sn.textMessageDetails?.messageText || sn.displayMessage || ''; if (!text) return null; break;
+    case 'superChatEvent': text = `\u{1F4B0} ${sn.superChatDetails?.amountDisplayString || ''} ${sn.superChatDetails?.userComment || ''}`.trim(); break;
+    case 'superStickerEvent': text = `\u{1F4B0} ${sn.superStickerDetails?.amountDisplayString || ''} [Super Sticker]`.trim(); break;
+    case 'newSponsorEvent': text = '\u2B50 New member'; break;
+    case 'memberMilestoneChatEvent': text = `\u2B50 ${sn.memberMilestoneChatDetails?.memberLevelName || 'Member'} ${sn.memberMilestoneChatDetails?.userComment || ''}`.trim(); break;
+    case 'membershipGiftingEvent': text = `\u{1F381} Gifted ${sn.membershipGiftingDetails?.giftMembershipsCount || ''} memberships`.replace(/\s+/g, ' ').trim(); break;
+    case 'giftMembershipReceivedEvent': text = '\u{1F381} Received a gifted membership'; break;
+    default: return null;
+  }
+  const badges = [];
+  if (au.isChatOwner) badges.push({ type: 'owner', label: 'Owner', url: '' });
+  if (au.isChatModerator) badges.push({ type: 'moderator', label: 'Moderator', url: '' });
+  if (au.isChatSponsor) badges.push({ type: 'member', label: 'Member', url: '' });
+  if (au.isVerified) badges.push({ type: 'verified', label: 'Verified', url: '' });
+  const key = `youtube-${it.id}`;
+  return { key, message: normalizeMessage('youtube', au.displayName || 'Viewer', text, au.profileImageUrl || '', key, badges) };
+}
+
+async function ytPollApi(chat, signal) {
+  const q = new URLSearchParams({ liveChatId: chat.liveChatId, part: 'snippet,authorDetails', maxResults: '200' });
+  if (chat.next.token) q.set('pageToken', chat.next.token);
+  const j = await ytApiJson(`https://www.googleapis.com/youtube/v3/liveChat/messages?${q}`, signal);
+  const entries = (j.items || []).map((it) => { try { return ytApiItemToEntry(it); } catch { return null; } }).filter(Boolean);
+  const next = typeof j.nextPageToken === 'string' && j.nextPageToken
+    ? { token: j.nextPageToken, wait: Number(j.pollingIntervalMillis) || 5000, kind: 'api' }
+    : null;
+  return { entries, next, ended: false };
+}
+
+// --- Chat polling over the web / innertube transports -----------------------
+async function ytPollWeb(chat, signal) {
+  const client = { clientName: 'WEB', clientVersion: chat.clientVersion, hl: 'en', gl: 'US' };
+  if (chat.visitorData) client.visitorData = chat.visitorData;
+  const r = await ytFetch(`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${encodeURIComponent(chat.apiKey)}&prettyPrint=false`, {
+    method: 'POST',
+    headers: ytWebHeaders({
+      'Content-Type': 'application/json',
+      Origin: 'https://www.youtube.com',
+      'X-Youtube-Client-Name': '1',
+      'X-Youtube-Client-Version': chat.clientVersion
+    }),
+    body: JSON.stringify({ context: { client }, continuation: chat.next.token }),
+    signal,
+    maxBytes: 2_000_000
+  });
+  if (r.status !== 200) {
+    const e = ytHttpError(r.status, 'get_live_chat');
+    try { const m = JSON.parse(r.text)?.error?.message; if (m) e.message += `: ${String(m).slice(0, 120)}`; } catch {}
+    throw e;
+  }
+  let data;
+  try { data = JSON.parse(r.text); } catch { throw new YtError('PARSE', 'get_live_chat returned invalid JSON'); }
+  return ytParseChatResponse(data);
+}
+
+const makeYtPollFn = (yt) => async (chat, signal) => {
+  if (chat.mode === 'api') return ytPollApi(chat, signal);
+  if (chat.mode === 'innertube' && yt) {
+    const res = await ytLib(() => yt.actions.execute('/live_chat/get_live_chat', { continuation: chat.next.token }), signal);
+    return ytParseChatResponse(res?.data || res);
+  }
+  return ytPollWeb(chat, signal);
+};
+
+// Tries every transport. Returns {status:'active', chat} or {status:'inactive', code, reason};
+// throws YtError when no transport could give a definitive answer.
+async function ytChatStart(videoId, { yt = null, signal } = {}) {
+  const errs = [];
+  const note = (label, e) => {
+    if (e?.code === 'ABORTED') throw e;
+    errs.push(e);
+    console.error(`[YouTube] ${label} failed for ${videoId}: ${e?.message || e}`);
+  };
+  try { return await ytPopoutStart(videoId, signal); } catch (e) { note('Popout chat page', e); }
+  if (yt) {
+    try { return await ytNextStart(yt, videoId, signal); } catch (e) { note('youtubei.js /next', e); }
+  }
+  if (YT_API_KEY) {
+    try { return await ytApiStart(videoId, signal); } catch (e) { note('Data API', e); }
+  }
+  const first = errs[0] || new YtError('NETWORK', 'no chat transport available');
+  throw new YtError(first.code, errs.map((e) => e?.message || e).join(' | '), { status: first.status });
+}
+
+function ytInactiveError(s) {
+  const code = s.code === 'REPLAY' ? 'NOT_LIVE' : s.code;
+  const msg = {
+    MEMBERS_ONLY: 'This live chat is members-only',
+    CHAT_DISABLED: 'Live chat is disabled for this stream',
+    NOT_FOUND: 'YouTube video not found',
+    NOT_LIVE: 'That video is not live (ended, or only a chat replay)',
+    NO_CHAT: 'That video has no live chat right now'
+  }[code] || s.reason || 'No live chat';
+  return new YtError(code, msg);
+}
+
+// --- Poller -----------------------------------------------------------------
+// One polling loop per instance: single timer, single in-flight request,
+// idempotent start(), stop() aborts the in-flight request and the timer.
+function createYtPoller({ chat, pollFn, onEntries, onEnd, seen, maxFailures = 6, log = console }) {
+  let stopped = false;
+  let running = false;
+  let started = false;
+  let timer = null;
+  let ctrl = null;
+  let firstPoll = true; // the first response is the backlog: remember it, do not replay it
+  let failures = 0;
+  let missing = 0;
+  const clamp = (n, lo, hi) => Math.min(Math.max(n, lo), hi);
+
+  for (const k of chat.seedKeys || []) seen(k);
+
+  const schedule = (ms) => {
+    if (stopped) return;
+    clearTimeout(timer);
+    timer = setTimeout(tick, Math.max(0, Math.round(ms * ytCfg.timeScale)));
+  };
+  const stop = () => {
+    stopped = true;
+    clearTimeout(timer);
+    try { ctrl?.abort(); } catch {}
+  };
+  const end = (reason, err, definitive) => {
+    if (stopped) return;
+    stop();
+    onEnd({ reason, err, definitive });
+  };
+
+  async function tick() {
+    if (stopped || running) return;
+    running = true;
+    ctrl = new AbortController();
+    let delay = 2000;
+    try {
+      const r = await pollFn(chat, ctrl.signal);
+      if (stopped) return;
+      failures = 0;
+
+      const fresh = [];
+      for (const e of r?.entries || []) {
+        if (e && !seen(e.key)) fresh.push(e.message);
+      }
+      if (!firstPoll && fresh.length) onEntries(fresh.slice(-100));
+      firstPoll = false;
+
+      if (r?.ended) return end('Stream ended', null, true);
+      if (r?.next && typeof r.next.token === 'string' && r.next.token) {
+        missing = 0;
+        chat.next = r.next;
+        delay = clamp(Number(r.next.wait) || 2000, chat.minWait ?? 1000, chat.maxWait ?? 10000);
+      } else {
+        // No continuation: retry the same token a couple of times before deciding the chat is over.
+        missing += 1;
+        log.warn?.(`[YouTube] Response had no continuation (${missing}/3)`);
+        if (missing >= 3) return end('Stream ended', null, true);
+        delay = 2000 * missing;
+      }
+    } catch (err) {
+      if (stopped || err?.code === 'ABORTED') return;
+      failures += 1;
+      log.error?.(`[YouTube] Chat poll failed (${failures}/${maxFailures}): ${err?.message || err}`);
+      if (err?.code === 'ENDED') return end('Stream ended', null, true);
+      if (err?.permanent) return end(err.message, err, false);
+      if (failures >= maxFailures) return end('Chat error', err, false);
+      delay = err?.code === 'RATE_LIMIT' || err?.code === 'FORBIDDEN'
+        ? Math.min(15000 * failures, 60000)
+        : Math.min(2000 * 2 ** (failures - 1), 30000);
+    } finally {
+      running = false;
+    }
+    schedule(delay);
+  }
+
+  return {
+    start() { if (started) return; started = true; tick(); },
+    stop,
+    get stopped() { return stopped; }
+  };
+}
+
+// --- Discovering the live video of a channel --------------------------------
+function ytRetryDelay(attempt, code) {
+  let base;
+  if (code === 'RATE_LIMIT' || code === 'FORBIDDEN' || code === 'CONSENT') base = Math.min(60000 * (attempt + 1), 300000);
+  else if (code === 'NOT_LIVE') base = [30000, 30000, 45000, 60000][Math.min(attempt, 3)];
+  else base = Math.min(10000 * 2 ** attempt, 120000);
+  return Math.round(base * (0.9 + Math.random() * 0.2));
+}
+
+async function ytChannelIdFromHandle(yt, handle, signal) {
+  const key = handle.toLowerCase();
+  const hit = ytChannelCache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.id;
+  let id = null;
+  if (yt) {
+    try {
+      const ep = await ytLib(() => yt.resolveURL(`https://www.youtube.com/@${handle}`), signal);
+      id = ep?.payload?.browseId || null;
+    } catch (e) { if (e.code === 'ABORTED') throw e; }
+  }
+  if (!id || !YT_CHANNEL_ID.test(id)) {
+    id = null;
+    try {
+      const p = await ytFetch(`https://www.youtube.com/@${encodeURIComponent(handle)}`, { headers: ytWebHeaders(), signal });
+      // Prefer the page's own identity fields over generic "browseId" hits,
+      // which can belong to recommended channels.
+      id = p.text.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/)?.[1]
+        || p.text.match(/itemprop="(?:channelId|identifier)" content="(UC[\w-]{22})"/)?.[1]
+        || p.text.match(/"externalId":"(UC[\w-]{22})"/)?.[1]
+        || p.text.match(/"channelId":"(UC[\w-]{22})"/)?.[1]
+        || null;
+    } catch (e) { if (e.code === 'ABORTED') throw e; }
+  }
+  if (id) {
+    if (ytChannelCache.size > 50) ytChannelCache.delete(ytChannelCache.keys().next().value);
+    ytChannelCache.set(key, { id, exp: Date.now() + 6 * 3600000 });
+  }
+  return id;
+}
+
+// <channel>/live redirects to the current stream when there is one.
+async function ytLivePage(pathPart, signal) {
+  const p = await ytFetch(`https://www.youtube.com/${pathPart}/live`, { headers: ytWebHeaders(), signal });
+  if (/consent\.(?:youtube|google)\.com/i.test(p.url)) throw new YtError('CONSENT', 'YouTube served a cookie-consent page for the /live check');
+  if (p.status === 404) throw new YtError('NOT_FOUND', 'YouTube channel not found');
+  if (p.status !== 200) throw ytHttpError(p.status, '/live page');
+  const id = p.url.match(/[?&]v=([\w-]{11})/)?.[1]
+    || p.text.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/)?.[1]
+    || null;
+  let confirmed = false;
+  if (id) {
+    const i = p.text.indexOf(`"videoDetails":{"videoId":"${id}"`);
+    if (i !== -1) confirmed = /"isLive(?:Now)?":true/.test(p.text.slice(i, i + 4000));
+  }
+  console.log(`[YouTube] /live page ${pathPart}: HTTP ${p.status}, ${p.text.length} bytes, video ${id || 'none'}${confirmed ? ' (live)' : ''}`);
+  return { id, confirmed };
+}
+
+// Structural walk of a browse response instead of regexing around ids.
+function ytCollectVideos(root) {
+  const seen = new Set();
+  const list = [];
+  ytWalk(root, (n) => {
+    let id = null;
+    let live = false;
+    if (typeof n.videoId === 'string' && (n.thumbnailOverlays || n.badges || n.title)) {
+      id = n.videoId;
+      live = /BADGE_STYLE_TYPE_LIVE_NOW|"style":"LIVE"|LIVE_NOW/.test(JSON.stringify([n.badges, n.thumbnailOverlays]));
+    } else if (typeof n.contentId === 'string' && n.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO') {
+      id = n.contentId;
+      live = /LIVE_NOW|"text":"LIVE"|"style":"LIVE"/i.test(JSON.stringify(n.contentImage || {}));
+    }
+    if (id && YT_VIDEO_ID.test(id) && !seen.has(id)) { seen.add(id); list.push({ id, live }); }
+    return null;
+  });
+  return list;
+}
+
+async function ytStreamsTabIds(yt, channelId, signal) {
+  if (!yt) return [];
+  const res = await ytLib(() => yt.actions.execute('/browse', { browseId: channelId, params: YT_STREAMS_TAB }), signal);
+  const vids = ytCollectVideos(res?.data || res);
+  console.log(`[YouTube] Streams tab ${channelId}: ${vids.length} video(s), ${vids.filter((v) => v.live).length} flagged live`);
+  return [...vids.filter((v) => v.live), ...vids.filter((v) => !v.live)].slice(0, 6);
+}
+
+async function ytInnertubeChannelIds(yt, channelId, signal) {
+  if (!yt) return [];
+  const channel = await ytLib(() => yt.getChannel(channelId), signal);
+  const out = [];
+  const idOf = (v) => v?.video_id || v?.id || v?.content_id;
+  const isLive = (v) => v?.is_live === true || (v?.badges || []).some?.((b) => /LIVE_NOW/i.test(String(b?.style || b?.label || '')));
+  for (const v of channel.videos || []) if (isLive(v) && YT_VIDEO_ID.test(String(idOf(v)))) out.push({ id: idOf(v), live: true });
+  if (channel.has_live_streams) {
+    const vids = (await ytLib(() => channel.getLiveStreams(), signal)).videos || [];
+    for (const v of vids.slice(0, 6)) if (YT_VIDEO_ID.test(String(idOf(v)))) out.push({ id: idOf(v), live: isLive(v) });
+  }
+  console.log(`[YouTube] Innertube channel ${channelId}: ${out.length} candidate(s)`);
+  return out.sort((a, b) => Number(b.live) - Number(a.live));
+}
+
+// RSS feed lists a channel's newest uploads and streams.
+async function ytFeedVideoIds(channelId, signal) {
+  const r = await ytFetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal,
+    maxBytes: 500_000
+  });
+  if (r.status !== 200) throw ytHttpError(r.status, 'RSS feed');
+  const ids = [...r.text.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)].map((m) => m[1]).slice(0, 5);
+  console.log(`[YouTube] RSS feed ${channelId}: ${ids.length} video(s)`);
+  return ids;
+}
+
+// Optional official API: 2 quota units per check. The key travels in a
+// header so it never appears in URLs or error messages.
+async function ytApiLiveIds(channelId, signal) {
+  if (!YT_API_KEY || !YT_CHANNEL_ID.test(channelId)) return [];
+  const pl = await ytApiJson(`https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=8&playlistId=UU${channelId.slice(2)}`, signal);
+  const ids = (pl.items || []).map((i) => i.contentDetails?.videoId).filter((x) => YT_VIDEO_ID.test(String(x)));
+  if (!ids.length) return [];
+  const v = await ytApiJson(`https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${ids.join(',')}`, signal);
+  const live = (v.items || []).filter((x) => x.snippet?.liveBroadcastContent === 'live').map((x) => x.id);
+  console.log(`[YouTube] Data API ${channelId}: ${ids.length} recent upload(s), ${live.length} live`);
+  return live;
+}
+
+// Staged discovery: cheap, most reliable sources first; later (heavier)
+// stages only run if earlier ones produced no verified live chat. At most
+// ytCfg.maxChatChecks chat pages are downloaded per discovery run.
+// Returns { videoId, chat } or throws YtError.
+async function ytFindLive(yt, t, signal) {
+  const tried = new Set();
+  let checks = 0;
+  let lastErr = null;
+  let blockedErr = null;
+  let sawData = false;
+  let channelId = t.type === 'channel' ? t.value : null;
+  let channelResolved = t.type === 'channel';
+  const pathPart = t.type === 'handle' ? `@${encodeURIComponent(t.value)}` : `channel/${t.value}`;
+
+  const getChannelId = async () => {
+    if (!channelResolved) {
+      channelId = await ytChannelIdFromHandle(yt, t.value, signal);
+      channelResolved = true;
+      console.log(`[YouTube] ${t.label}: channel id ${channelId || 'NOT RESOLVED'}`);
+    }
+    return channelId;
+  };
+
+  const verify = async (cands) => {
+    for (const c of cands) {
+      if (!YT_VIDEO_ID.test(String(c.id)) || tried.has(c.id) || ytIsDead(c.id)) continue;
+      if (checks >= ytCfg.maxChatChecks) return null;
+      tried.add(c.id);
+      checks += 1;
+      try {
+        const s = await ytChatStart(c.id, { yt, signal });
+        sawData = true;
+        if (s.status === 'active') {
+          console.log(`[YouTube] ${t.label}: active live chat on ${c.id} via ${c.src} (${s.chat.mode})`);
+          return { videoId: c.id, chat: s.chat };
+        }
+        ytMarkDead(c.id, s.code);
+        if (s.code === 'MEMBERS_ONLY' || s.code === 'CHAT_DISABLED') blockedErr = ytInactiveError(s);
+      } catch (e) {
+        if (e.code === 'ABORTED') throw e;
+        lastErr = e;
+        // Blocked / rate-limited / consent affects every candidate equally: stop hammering.
+        if (['RATE_LIMIT', 'FORBIDDEN', 'CONSENT'].includes(e.code)) throw e;
+      }
+    }
+    return null;
+  };
+
+  const stages = [
+    async () => {
+      const r = await ytLivePage(pathPart, signal);
+      sawData = true;
+      return r.id ? [{ id: r.id, src: '/live page', live: r.confirmed }] : [];
+    },
+    async () => ((await getChannelId()) ? (await ytApiLiveIds(channelId, signal)).map((id) => ({ id, src: 'Data API' })) : []),
+    async () => ((await getChannelId()) ? (await ytStreamsTabIds(yt, channelId, signal)).map((v) => ({ id: v.id, src: 'streams tab', live: v.live })) : []),
+    async () => ((await getChannelId()) ? (await ytInnertubeChannelIds(yt, channelId, signal)).map((v) => ({ id: v.id, src: 'Innertube channel', live: v.live })) : []),
+    async () => ((await getChannelId()) ? (await ytFeedVideoIds(channelId, signal)).map((id) => ({ id, src: 'RSS feed' })) : [])
+  ];
+
+  for (const stage of stages) {
+    let cands = [];
+    try {
+      cands = await stage();
+    } catch (e) {
+      if (e.code === 'ABORTED' || e.code === 'NOT_FOUND') throw e;
+      lastErr = e;
+      console.error(`[YouTube] ${t.label}: discovery step failed: ${e?.message || e}`);
+    }
+    // Confirmed-live candidates are verified first.
+    cands.sort((a, b) => Number(!!b.live) - Number(!!a.live));
+    const found = await verify(cands);
+    if (found) return found;
+    if (checks >= ytCfg.maxChatChecks) break;
+  }
+
+  if (blockedErr) throw blockedErr;
+  if (!sawData && lastErr) throw lastErr; // show the real reason (e.g. 403) instead of "not live"
+  throw new YtError('NOT_LIVE', `${t.label} is not live right now`);
+}
+
+async function ytStartVideo(yt, videoId, signal) {
+  const s = await ytChatStart(videoId, { yt, signal });
+  if (s.status === 'active') return { videoId, chat: s.chat };
+  ytMarkDead(videoId, s.code);
+  throw ytInactiveError(s);
+}
+
+// --- Connection lifecycle ---------------------------------------------------
 async function connectYouTube(input) {
-  disconnectPlatform('youtube');
+  disconnectPlatform('youtube'); // stops the previous session, timers and in-flight requests
   const targets = youTubeTargets(input);
   if (!targets.length) {
-    return updatePlatformStatus('youtube', 'error', String(input), 'Use a @handle, channel URL, or video URL/ID');
+    return updatePlatformStatus('youtube', 'error', String(input).slice(0, 80), 'Use a @handle, channel URL, or video URL/ID');
   }
   const token = Symbol('yt');
-  activeAdapters.youtube.token = token;
+  const session = {
+    ctrl: new AbortController(),
+    poller: null,
+    stop() { this.ctrl.abort(); this.poller?.stop(); }
+  };
+  const a = activeAdapters.youtube;
+  a.token = token;
+  a.instance = session;
+  const label = targets[0].label;
   console.log(`[YouTube] Connecting: ${targets.map((t) => `${t.type}:${t.value}`).join(', ')}`);
-  updatePlatformStatus('youtube', 'connecting', targets[0].label);
-  runYouTube(targets, token, targets[0].label);
+  updatePlatformStatus('youtube', 'connecting', label);
+  const ctx = { targets, token, label, session, attempt: 0, watching: targets.some((t) => t.type !== 'video') };
+  runYouTube(ctx).catch((err) => {
+    console.error('[YouTube] Unexpected failure:', err);
+    if (activeAdapters.youtube.token === token) updatePlatformStatus('youtube', 'error', label, String(err?.message || err));
+  });
 }
 
-async function runYouTube(targets, token, label) {
+const YT_RANK = { NOT_LIVE: 6, NETWORK: 5, TIMEOUT: 5, SERVER: 5, RATE_LIMIT: 5, FORBIDDEN: 5, CONSENT: 5, BAD_RESPONSE: 5, MEMBERS_ONLY: 4, CHAT_DISABLED: 4, NO_CHAT: 3, NOT_FOUND: 1 };
+const bestYtError = (errs) => errs.slice().sort((a, b) => (YT_RANK[b.code] || 2) - (YT_RANK[a.code] || 2))[0];
+
+async function runYouTube(ctx) {
+  const { targets, token, label, session, watching } = ctx;
   const adapter = () => activeAdapters.youtube;
-  const current = () => adapter().token === token;
-  const watching = targets.some((t) => t.type !== 'video');
+  const current = () => adapter().token === token && !session.ctrl.signal.aborted;
 
   const fail = (msg) => {
     console.error(`[YouTube] ${msg}`);
-    if (current()) updatePlatformStatus('youtube', 'error', label, msg);
-  };
-  const retryLater = (why) => {
     if (!current()) return;
-    console.log(`[YouTube] ${why}. Checking again in ${YT_RETRY_MS / 1000}s`);
-    updatePlatformStatus('youtube', 'connecting', `${label} (${String(why).slice(0, 80)})`);
+    session.stop();
+    updatePlatformStatus('youtube', 'error', label, msg);
+  };
+
+  const retryLater = (err) => {
+    if (!current()) return;
+    const code = err?.code || 'NOT_LIVE';
+    const why = String(err?.message || 'Not live');
+    ctx.attempt += 1;
+    if (!watching && ctx.attempt > ytCfg.maxVideoRetries) return fail(why);
+    const blocked = code === 'MEMBERS_ONLY' || code === 'CHAT_DISABLED';
+    const delay = Math.round((blocked ? 300000 : ytRetryDelay(ctx.attempt - 1, code)) * ytCfg.timeScale);
+    console.log(`[YouTube] ${why}. Checking again in ${Math.round(delay / 1000)}s`);
+    if (blocked || code === 'FORBIDDEN' || code === 'RATE_LIMIT' || code === 'CONSENT') {
+      updatePlatformStatus('youtube', 'error', label, why);
+    } else {
+      updatePlatformStatus('youtube', 'connecting', `${label} (${why.slice(0, 80)})`);
+    }
     clearTimeout(adapter().retry);
-    adapter().retry = setTimeout(() => runYouTube(targets, token, label), YT_RETRY_MS);
+    adapter().retry = setTimeout(() => {
+      runYouTube(ctx).catch((e) => console.error('[YouTube] Retry crashed:', e));
+    }, delay);
+  };
+
+  const handleFailure = (err) => {
+    if (err?.code === 'ABORTED' || !current()) return;
+    if (watching) {
+      // A typo'd handle will never work; everything else is worth retrying.
+      if (err.code === 'NOT_FOUND' && targets.every((t) => t.type !== 'video')) return fail(err.message);
+      return retryLater(err);
+    }
+    if (err.permanent || err.code === 'NOT_LIVE' || err.code === 'NO_CHAT') return fail(err.message);
+    return retryLater(err); // transient (network, 403, 5xx...): bounded retries
   };
 
   try {
-    const yt = await getInnertube();
+    const yt = await getInnertubeSafe();
     if (!current()) return;
 
-    // 1. Find a live video ID.
-    let videoId = null;
-    let notLive = false;
-    let lastErr = null;
+    let found = null;
+    const errs = [];
     for (const t of targets) {
       try {
-        videoId = t.type === 'video' ? t.value : await findLiveVideoId(yt, t);
-        if (videoId) break;
+        found = t.type === 'video' ? await ytStartVideo(yt, t.value, session.ctrl.signal) : await ytFindLive(yt, t, session.ctrl.signal);
+        if (found) break;
       } catch (e) {
-        lastErr = e;
-        if (e.code === 'NOT_LIVE') notLive = true;
+        if (e?.code === 'ABORTED') return;
+        errs.push(e instanceof YtError ? e : new YtError('NETWORK', String(e?.message || e)));
       }
     }
     if (!current()) return;
-    if (!videoId) {
-      if (notLive || watching) return retryLater(lastErr?.message || 'Not live');
-      return fail(lastErr?.message || 'YouTube video not found');
-    }
+    if (!found) return handleFailure(bestYtError(errs) || new YtError('NOT_LIVE', `${label} is not live right now`));
 
-    // 2. Get the chat continuation (skips the blocked /player endpoint).
-    const chat = await ytChatStart(yt, videoId);
-    if (!current()) return;
-    if (!chat) {
-      return watching ? retryLater('No live chat yet') : fail('That video has no live chat right now');
-    }
-
-    // 3. Poll the chat.
-    const isSeen = makeSeen(1000);
-    let stopped = false;
-    let firstPoll = true; // remember the backlog, do not replay it
-    let failures = 0;
-    let timer = null;
-
-    const finish = (why, err) => {
-      if (stopped) return;
-      stopped = true;
-      clearTimeout(timer);
-      if (!current()) return;
-      adapter().instance = null;
-      if (watching) {
-        ytClientPromise = null;
-        return retryLater(why);
-      }
-      if (err) return fail(String(err?.message || err));
-      updatePlatformStatus('youtube', 'disconnected');
-    };
-
-    const poll = async () => {
-      if (stopped || !current()) return;
-      let delay = 2000;
-      try {
-        const data = await ytChatPoll(yt, chat);
-        const lcc = data?.continuationContents?.liveChatContinuation;
-        if (!lcc) return finish('Stream ended');
-
-        failures = 0;
-        for (const a of lcc.actions || []) {
-          const msg = ytItemToMessage(a?.addChatItemAction?.item, isSeen);
-          if (msg && !firstPoll) broadcastMessage(msg);
+    const seen = makeSeen(1500);
+    const poller = createYtPoller({
+      chat: found.chat,
+      pollFn: makeYtPollFn(yt),
+      seen,
+      onEntries: (msgs) => {
+        if (!current()) return; // an older connection must never broadcast
+        for (const m of msgs) {
+          try { broadcastMessage(m); } catch (err) { console.error('[YouTube] broadcast failed:', err); }
         }
-        firstPoll = false;
-
-        const n = ytNextContinuation(lcc.continuations);
-        if (!n) return finish('Stream ended');
-        chat.next = n;
-        delay = Math.min(Math.max(Number(n.wait) || 2000, 1000), 8000);
-      } catch (err) {
-        failures += 1;
-        console.error(`[YouTube] Chat poll failed (${failures}):`, err?.message || err);
-        if (failures >= 5) return finish('Chat error', err);
-        delay = Math.min(2000 * failures, 10000);
+      },
+      onEnd: ({ reason, err, definitive }) => {
+        if (!current()) return;
+        session.poller = null;
+        if (definitive) ytMarkDead(found.videoId, 'REPLAY');
+        console.log(`[YouTube] Chat of ${found.videoId} stopped: ${reason}`);
+        if (watching) return retryLater(err instanceof YtError ? err : new YtError('NOT_LIVE', reason));
+        if (err) return fail(String(err?.message || err));
+        updatePlatformStatus('youtube', 'disconnected');
       }
-      if (!stopped && current()) timer = setTimeout(poll, delay);
-    };
-
-    adapter().instance = { stop: () => { stopped = true; clearTimeout(timer); } };
-    console.log(`[YouTube] Connected to live chat of video ${videoId} (${chat.mode})`);
+    });
+    session.poller = poller;
+    ctx.attempt = 0;
+    console.log(`[YouTube] Connected to live chat of video ${found.videoId} (${found.chat.mode})`);
     updatePlatformStatus('youtube', 'connected', label);
-    poll();
+    poller.start();
   } catch (err) {
-    const msg = String(err?.message || err);
-    console.error('[YouTube] Connect failed:', msg);
+    if (err?.code === 'ABORTED') return;
+    console.error('[YouTube] Connect failed:', err?.message || err);
     ytClientPromise = null;
-    if (watching) return retryLater(msg);
-    fail(msg);
+    handleFailure(err instanceof YtError ? err : new YtError('NETWORK', String(err?.message || err)));
   }
 }
 
@@ -836,6 +1409,7 @@ function twitchBadgeSets(scope, roomId = '', login = '') {
     return v;
   });
   twitchBadgeCache.set(key, entry);
+  if (twitchBadgeCache.size > 100) twitchBadgeCache.delete(twitchBadgeCache.keys().next().value); // bound memory
   return entry.p;
 }
 
@@ -1042,13 +1616,15 @@ async function getKickPublicKey(refresh = false) {
   return kickPublicKeyPem;
 }
 
+// The signed payload is `${id}.${timestamp}.${rawBody}`. The body is appended
+// as the exact received bytes (no utf8 round-trip) so the signature matches.
 function kickSignatureValid(headers, rawBody, pem) {
   const id = headers['kick-event-message-id'];
   const ts = headers['kick-event-message-timestamp'];
   const sig = headers['kick-event-signature'];
   if (!id || !ts || !sig) return false;
   const key = crypto.createPublicKey(pem);
-  const data = Buffer.from(`${id}.${ts}.${rawBody.toString('utf8')}`);
+  const data = Buffer.concat([Buffer.from(`${id}.${ts}.`), rawBody]);
   const algo = key.asymmetricKeyType === 'ed25519' ? null : 'RSA-SHA256'; // RSA or Ed25519
   return crypto.verify(algo, data, key, Buffer.from(sig, 'base64'));
 }
@@ -1148,7 +1724,8 @@ async function connectRumble(input) {
     if (!current()) return;
     let delay = RUMBLE_POLL_MS;
     try {
-      const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+      // redirect:'error' keeps the secret key from being forwarded to another host.
+      const res = await fetch(url, { headers: { Accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
       if ([401, 403, 404].includes(res.status)) {
         // Wrong or revoked key: retrying will not help.
         return updatePlatformStatus('rumble', 'error', '', `Rumble rejected the API key (HTTP ${res.status}). Reset it at rumble.com/account/livestream-api`);
@@ -1252,7 +1829,7 @@ const connectors = {
 };
 
 app.post('/api/connect', requireAuth, (req, res) => {
-  const { platform, handle } = req.body;
+  const { platform, handle } = req.body || {};
   const connect = Object.prototype.hasOwnProperty.call(connectors, platform) ? connectors[platform] : null;
   if (!connect) return res.status(400).json({ error: 'Unsupported platform' });
   if (typeof handle !== 'string' || !handle.trim() || handle.length > 200) {
@@ -1271,7 +1848,7 @@ app.post('/api/instagram/login', requireAuth, (_req, res) => {
 });
 
 app.post('/api/disconnect', requireAuth, (req, res) => {
-  const { platform } = req.body;
+  const { platform } = req.body || {};
   if (!PLATFORMS.includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
   disconnectPlatform(platform);
   res.json({ success: true });
@@ -1338,8 +1915,6 @@ io.on('connection', (socket) => {
 // ---------------------------------------------------------------------------
 // Start / shutdown
 // ---------------------------------------------------------------------------
-server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: platforms-v6]`));
-
 function shutdown() {
   console.log('Shutting down, stopping adapters...');
   PLATFORMS.forEach((p) => disconnectPlatform(p, { silent: true }));
@@ -1347,6 +1922,24 @@ function shutdown() {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-process.on('unhandledRejection', (err) => console.error('[Unhandled rejection]', err));
+
+// Internals exposed for the unit tests (harmless in production).
+module.exports = {
+  app,
+  server,
+  io,
+  _test: {
+    youTubeTargets, ytAnalyzeChatPage, ytParseChatResponse, ytExtractContinuation, ytExtractInitialData,
+    ytItemToEntry, ytActionsToEntries, ytFetch, createYtPoller, ytCfg, YtError, ytHttpError,
+    ytApiItemToEntry, ytCollectVideos, makeSeen, normalizeMessage, connectYouTube, activeAdapters,
+    ytDeadVideos, ytChatStart, ytRetryDelay, disconnectPlatform, kickSignatureValid, resolveRumbleUrl, snapshot
+  }
+};
+
+if (require.main === module) {
+  server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: platforms-v7]`));
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  process.on('unhandledRejection', (err) => console.error('[Unhandled rejection]', err));
+  process.on('uncaughtException', (err) => console.error('[Uncaught exception]', err));
+}
