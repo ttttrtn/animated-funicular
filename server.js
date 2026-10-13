@@ -1034,6 +1034,7 @@ function ytCollectVideos(root) {
       id = n.contentId;
       live = /LIVE_NOW|"text":"LIVE"|"style":"LIVE"/i.test(JSON.stringify(n.contentImage || {}));
     }
+    if (id && !live && /upcomingEventData|UPCOMING/.test(JSON.stringify(n).slice(0, 6000))) id = null; // scheduled, not live yet
     if (id && YT_VIDEO_ID.test(id) && !seen.has(id)) { seen.add(id); list.push({ id, live }); }
     return null;
   });
@@ -1113,7 +1114,8 @@ async function ytFindLive(yt, t, signal, { all = false, skip = null } = {}) {
     return channelId;
   };
 
-  const verify = async (cands) => {
+  const weakAll = [];
+  const verify = async (cands, collect = all) => {
     for (const c of cands) {
       if (!YT_VIDEO_ID.test(String(c.id)) || tried.has(c.id) || ytIsDead(c.id)) continue;
       if (checks >= ytCfg.maxChatChecks) return null;
@@ -1124,7 +1126,7 @@ async function ytFindLive(yt, t, signal, { all = false, skip = null } = {}) {
         sawData = true;
         if (s.status === 'active') {
           console.log(`[YouTube] ${t.label}: active live chat on ${c.id} via ${c.src} (${s.chat.mode})`);
-          if (!all) return { videoId: c.id, chat: s.chat };
+          if (!collect) return { videoId: c.id, chat: s.chat };
           results.push({ videoId: c.id, chat: s.chat });
           continue;
         }
@@ -1146,7 +1148,7 @@ async function ytFindLive(yt, t, signal, { all = false, skip = null } = {}) {
       sawData = true;
       return r.id ? [{ id: r.id, src: '/live page', live: r.confirmed }] : [];
     },
-    async () => ((await getChannelId()) ? (await ytApiLiveIds(channelId, signal)).map((id) => ({ id, src: 'Data API' })) : []),
+    async () => ((await getChannelId()) ? (await ytApiLiveIds(channelId, signal)).map((id) => ({ id, src: 'Data API', live: true })) : []),
     async () => ((await getChannelId()) ? (await ytStreamsTabIds(yt, channelId, signal)).map((v) => ({ id: v.id, src: 'streams tab', live: v.live })) : []),
     async () => ((await getChannelId()) ? (await ytInnertubeChannelIds(yt, channelId, signal)).map((v) => ({ id: v.id, src: 'Innertube channel', live: v.live })) : []),
     async () => ((await getChannelId()) ? (await ytFeedVideoIds(channelId, signal)).map((id) => ({ id, src: 'RSS feed' })) : [])
@@ -1163,12 +1165,24 @@ async function ytFindLive(yt, t, signal, { all = false, skip = null } = {}) {
     }
     // Confirmed-live candidates are verified first.
     cands.sort((a, b) => Number(!!b.live) - Number(!!a.live));
+    if (all) {
+      // Multi-stream mode: only candidates flagged live are connected. Unflagged
+      // ones (RSS, old uploads, scheduled streams) are a last resort below.
+      weakAll.push(...cands.filter((c) => !c.live));
+      await verify(cands.filter((c) => c.live));
+      if (checks >= ytCfg.maxChatChecks) break;
+      continue;
+    }
     const found = await verify(cands);
     if (found) return found;
     if (checks >= ytCfg.maxChatChecks) break;
   }
 
   if (all && results.length) return results; // every verified live stream of the channel
+  if (all && weakAll.length) {
+    const one = await verify(weakAll, false); // nothing flagged live: fall back to the first active chat
+    if (one) return [one];
+  }
   if (blockedErr) throw blockedErr;
   if (!sawData && lastErr) throw lastErr; // show the real reason (e.g. 403) instead of "not live"
   throw new YtError('NOT_LIVE', `${t.label} is not live right now`);
@@ -1986,7 +2000,7 @@ module.exports = {
     youTubeTargets, ytAnalyzeChatPage, ytParseChatResponse, ytExtractContinuation, ytExtractInitialData,
     ytItemToEntry, ytActionsToEntries, ytFetch, createYtPoller, ytCfg, YtError, ytHttpError,
     ytApiItemToEntry, ytCollectVideos, makeSeen, normalizeMessage, connectYouTube, activeAdapters,
-    ytDeadVideos, ytChatStart, ytRetryDelay, disconnectPlatform, kickSignatureValid, resolveRumbleUrl, snapshot
+    ytDeadVideos, setInnertube: (o) => { ytClientPromise = Promise.resolve(o); }, ytChatStart, ytRetryDelay, disconnectPlatform, kickSignatureValid, resolveRumbleUrl, snapshot
   }
 };
 
