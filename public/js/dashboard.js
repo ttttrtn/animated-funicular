@@ -13,7 +13,7 @@ function render() {
     <div class="card" id="c-${p}"><div class="ch"><img src="/icons/${p}.svg"><h3>${P[p].toUpperCase()}</h3>
       <span class="badge disconnected" id="s-${p}">offline</span><button class="x" title="Remove" onclick="removeP('${p}')">✕</button></div>
       <input type="text" id="h-${p}" placeholder="${hint[p]}" value="${(saved.handles[p]||'').replace(/"/g,'&quot;')}">
-      <div class="row">${['twitch','kick','youtube','tiktok','instagram'].includes(p) ? `<button class="btn" onclick="location.href='/auth/${p}'">Log in</button>` : ''}
+      <div class="row">${['twitch','kick','youtube','instagram'].includes(p) ? `<button class="btn" onclick="location.href='/auth/${p}'">Log in</button>` : ''}
       <button class="btn primary" onclick="conn('${p}')">Connect</button><button class="btn" onclick="disc('${p}')">Disconnect</button></div>
       ${['twitch','kick'].includes(p) ? '' : `<input type="number" min="0" placeholder="Viewers (type from the app, 0 = clear)" onchange="post('/api/viewers',{platform:'${p}',count:this.value})">`}
       <div class="err" id="e-${p}"></div></div>`).join('');

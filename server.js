@@ -1979,9 +1979,7 @@ const OAUTH = {
   youtube: { id: 'GOOGLE_CLIENT_ID', secret: 'GOOGLE_CLIENT_SECRET', auth: 'https://accounts.google.com/o/oauth2/v2/auth', token: 'https://oauth2.googleapis.com/token', scope: 'https://www.googleapis.com/auth/youtube.readonly', extra: { access_type: 'online', prompt: 'select_account' },
     async name(t) { const j = await fetch('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', { headers: { Authorization: `Bearer ${t}` } }).then((r) => r.json()); return j.items?.[0]?.snippet?.customUrl; } },
   instagram: { id: 'INSTAGRAM_APP_ID', secret: 'INSTAGRAM_APP_SECRET', auth: 'https://www.instagram.com/oauth/authorize', token: 'https://api.instagram.com/oauth/access_token', scope: 'instagram_business_basic',
-    async name(t) { const j = await fetch(`https://graph.instagram.com/me?fields=username&access_token=${encodeURIComponent(t)}`).then((r) => r.json()); return j.username ? '@' + j.username : ''; } },
-  tiktok: { id: 'TIKTOK_CLIENT_KEY', secret: 'TIKTOK_CLIENT_SECRET', auth: 'https://www.tiktok.com/v2/auth/authorize/', token: 'https://open.tiktokapis.com/v2/oauth/token/', scope: 'user.info.basic,user.info.profile', idParam: 'client_key',
-    async name(t) { const j = await fetch('https://open.tiktokapis.com/v2/user/info/?fields=username,display_name', { headers: { Authorization: `Bearer ${t}` } }).then((r) => r.json()); return j.data?.user?.username; } }
+    async name(t) { const j = await fetch(`https://graph.instagram.com/me?fields=username&access_token=${encodeURIComponent(t)}`).then((r) => r.json()); return j.username ? '@' + j.username : ''; } }
 };
 const oauthStates = new Map(); // state -> { p, verifier }
 const oauthRedirect = (req, p) => `${process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`}/auth/${p}/callback`;
