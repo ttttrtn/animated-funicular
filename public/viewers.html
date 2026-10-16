@@ -1,0 +1,9 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>MalikGPT Viewer Count</title><script src="/socket.io/socket.io.js"></script>
+<style>html,body{margin:0;background:transparent;overflow:hidden;font-family:Segoe UI,sans-serif;color:#fff;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000}
+#w{position:absolute;top:16px;left:16px;display:none;align-items:center;gap:12px;font-size:34px;font-weight:800}#w img{width:32px;height:32px}#ic{display:flex;gap:6px}.n{color:#00f2fe}</style></head>
+<body><div id="w"><span id="ic"></span><span class="n" id="n"></span></div><script>
+const q=new URLSearchParams(location.search),only=q.get('platforms')?q.get('platforms').split(','):null;
+io().on('viewerCounts',v=>{let t=0;const ic=document.getElementById('ic');ic.innerHTML='';
+ for(const[p,n]of Object.entries(v)){if(only&&!only.includes(p))continue;t+=n;const i=document.createElement('img');i.src=`/icons/${p.replace(/[^a-z]/g,'')}.svg`;ic.append(i)}
+ document.getElementById('n').textContent=t.toLocaleString();document.getElementById('w').style.display=ic.children.length?'flex':'none'});
+</script></body></html>

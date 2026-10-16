@@ -5,7 +5,25 @@ services:
     buildCommand: "npm install && pip install -r requirements.txt"
     startCommand: "npm start"
     envVars:
-      - key: DASHBOARD_PASS
-        generateValue: true
+      - key: TWITCH_CLIENT_ID
+        sync: false
+      - key: TWITCH_CLIENT_SECRET
+        sync: false
+      - key: KICK_CLIENT_ID
+        sync: false
+      - key: KICK_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: TIKTOK_CLIENT_KEY
+        sync: false
+      - key: TIKTOK_CLIENT_SECRET
+        sync: false
+      - key: INSTAGRAM_APP_ID
+        sync: false
+      - key: INSTAGRAM_APP_SECRET
+        sync: false
       - key: NODE_ENV
         value: production

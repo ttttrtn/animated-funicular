@@ -1,93 +1,16 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MalikGPT — Stream Command Dashboard</title>
-  <link rel="stylesheet" href="/css/dashboard.css">
-  <script src="/socket.io/socket.io.js"></script>
-</head>
-<body>
-  <div class="dashboard-container">
-    <header class="header">
-      <div class="brand"><h1>MalikGPT <span>Unified Chat</span></h1></div>
-      <div class="auth-bar">
-        <input type="password" id="authPass" placeholder="Dashboard Secret Key">
-        <button id="copyOverlayBtn" class="btn btn-accent">Copy OBS Overlay URL</button>
-      </div>
-    </header>
-    <main class="grid-layout">
-      <section class="platform-grid">
-        <div class="card">
-          <div class="card-header"><img src="/icons/youtube.svg" class="icon"><h3>YOUTUBE</h3><span class="status-badge disconnected" id="status-youtube">Offline</span></div>
-          <div class="card-body">
-            <input type="text" id="input-youtube" placeholder="Channel / Handle">
-            <div class="actions">
-              <button onclick="connectPlatform('youtube')" class="btn btn-primary">Connect</button>
-              <button onclick="disconnectPlatform('youtube')" class="btn btn-secondary">Disconnect</button>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header"><img src="/icons/tiktok.svg" class="icon"><h3>TIKTOK</h3><span class="status-badge disconnected" id="status-tiktok">Offline</span></div>
-          <div class="card-body">
-            <input type="text" id="input-tiktok" placeholder="Channel / Handle">
-            <div class="actions">
-              <button onclick="connectPlatform('tiktok')" class="btn btn-primary">Connect</button>
-              <button onclick="disconnectPlatform('tiktok')" class="btn btn-secondary">Disconnect</button>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header"><img src="/icons/twitch.svg" class="icon"><h3>TWITCH</h3><span class="status-badge disconnected" id="status-twitch">Offline</span></div>
-          <div class="card-body">
-            <input type="text" id="input-twitch" placeholder="Channel / Handle">
-            <div class="actions">
-              <button onclick="connectPlatform('twitch')" class="btn btn-primary">Connect</button>
-              <button onclick="disconnectPlatform('twitch')" class="btn btn-secondary">Disconnect</button>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header"><img src="/icons/kick.svg" class="icon"><h3>KICK</h3><span class="status-badge disconnected" id="status-kick">Offline</span></div>
-          <div class="card-body">
-            <input type="text" id="input-kick" placeholder="Channel / Handle">
-            <div class="actions">
-              <button onclick="connectPlatform('kick')" class="btn btn-primary">Connect</button>
-              <button onclick="disconnectPlatform('kick')" class="btn btn-secondary">Disconnect</button>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header"><img src="/icons/facebook.svg" class="icon"><h3>FACEBOOK</h3><span class="status-badge disconnected" id="status-facebook">Offline</span></div>
-          <div class="card-body">
-            <input type="text" id="input-facebook" placeholder="Channel / Handle">
-            <div class="actions">
-              <button onclick="connectPlatform('facebook')" class="btn btn-primary">Connect</button>
-              <button onclick="disconnectPlatform('facebook')" class="btn btn-secondary">Disconnect</button>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header"><img src="/icons/rumble.svg" class="icon"><h3>RUMBLE</h3><span class="status-badge disconnected" id="status-rumble">Offline</span></div>
-          <div class="card-body">
-            <input type="text" id="input-rumble" placeholder="Channel / Handle">
-            <div class="actions">
-              <button onclick="connectPlatform('rumble')" class="btn btn-primary">Connect</button>
-              <button onclick="disconnectPlatform('rumble')" class="btn btn-secondary">Disconnect</button>
-            </div>
-          </div>
-        </div>
-      </section>
-      <section class="feed-section">
-        <div class="feed-header">
-          <h2>Unified Chat Feed</h2>
-          <button id="clearChatBtn" class="btn btn-small">Clear</button>
-        </div>
-        <div class="chat-feed" id="dashboardChatFeed"></div>
-      </section>
-    </main>
-  </div>
-  <script src="/js/dashboard.js"></script>
-</body>
-</html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MalikGPT — Stream Command Dashboard</title>
+<link rel="stylesheet" href="/css/dashboard.css"><script src="/socket.io/socket.io.js"></script></head>
+<body><div class="wrap">
+<header><h1>MalikGPT <span>Unified Chat</span></h1>
+<div class="links"><button class="btn ghost" data-copy="/overlay.html">Copy chat overlay</button><button class="btn ghost" data-copy="/viewers.html">Copy viewer overlay</button><button class="btn ghost" data-copy="/dock.html">Copy chat dock</button></div></header>
+<section class="panel toolbar">
+<label class="switch"><input type="checkbox" id="swIcon"><i></i>Show channel icon (Twitch)</label>
+<div class="iconup"><img id="iconPrev" alt="" hidden><label class="btn ghost">Upload icon<input type="file" id="iconFile" accept="image/png,image/jpeg,image/webp,image/gif" hidden></label><button class="btn ghost" id="iconDel" hidden>Remove</button></div>
+<label class="switch"><input type="checkbox" id="swTikTok" checked><i></i>TikTok enabled</label>
+<div class="add"><select id="addSel"></select><button class="btn primary" id="addBtn">+ Add platform</button><button class="btn" id="allBtn">Connect all</button></div>
+</section>
+<main><section id="cards" class="cards"></section>
+<section class="panel feed"><div class="fh"><h2>Live chat</h2><div class="vc" id="vc"></div><button class="btn ghost" id="clr">Clear</button></div><div id="feed"></div></section></main>
+</div><script src="/js/dashboard.js"></script></body></html>

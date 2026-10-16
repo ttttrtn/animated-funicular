@@ -112,6 +112,8 @@ function buildBadges(list) {
   return wrap.children.length ? wrap : null;
 }
 
+let showIcon = params.get('channelIcon') === '1';
+socket.on('settings', (s) => { if (params.get('channelIcon') === null) showIcon = !!s.showChannelIcon; });
 const seen = new Set();
 socket.on('chatMessage', (msg) => {
   if (msg.id) {
@@ -127,6 +129,7 @@ socket.on('chatMessage', (msg) => {
   const icon = document.createElement('img');
   icon.className = 'p-icon';
   icon.src = `/icons/${String(msg.platform).replace(/[^a-z]/g, '')}.svg`;
+  if (showIcon && msg.channelIcon) { icon.src = msg.channelIcon; icon.style.borderRadius = '50%'; }
   icon.onerror = () => icon.remove();
 
   const badges = buildBadges(msg.badges);

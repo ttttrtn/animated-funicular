@@ -1,34 +1,28 @@
-:root {
-  --bg-dark: #0f0c1b; --card-bg: #18142a; --accent-purple: #8a2be2; --accent-cyan: #00f2fe;
-  --text-main: #f1f1f1; --text-muted: #a0a0b0; --status-online: #00ff88; --status-offline: #ff4757;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, sans-serif; }
-body { background: var(--bg-dark); color: var(--text-main); min-height: 100vh; padding: 20px; }
-.dashboard-container { max-width: 1400px; margin: 0 auto; }
-.header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 20px; border-bottom: 1px solid #282244; margin-bottom: 20px; }
-.brand h1 { font-size: 1.8rem; } .brand h1 span { color: var(--accent-cyan); }
-.auth-bar { display: flex; gap: 10px; }
-.auth-bar input { background: #120e24; border: 1px solid #332a58; color: #fff; padding: 8px 12px; border-radius: 6px; }
-.grid-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-.platform-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
-.card { background: var(--card-bg); border: 1px solid #282244; border-radius: 8px; padding: 15px; }
-.card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-.card-header .icon { width: 22px; height: 22px; }
-.card-header h3 { font-size: 1rem; flex-grow: 1; }
-.status-badge { font-size: 0.75rem; padding: 3px 8px; border-radius: 12px; text-transform: uppercase; font-weight: bold; }
-.status-badge.connected { background: rgba(0, 255, 136, 0.15); color: var(--status-online); }
-.status-badge.disconnected { background: rgba(255, 71, 87, 0.15); color: var(--status-offline); }
-.status-badge.connecting { background: rgba(255, 165, 0, 0.15); color: orange; }
-.card-body input { width: 100%; background: #110d22; border: 1px solid #2e264f; color: #fff; padding: 8px; border-radius: 4px; margin-bottom: 10px; }
-.actions { display: flex; gap: 8px; }
-.btn { border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; }
-.btn-primary { background: var(--accent-purple); color: #fff; flex-grow: 1; }
-.btn-secondary { background: #2b2447; color: #ccc; }
-.btn-accent { background: var(--accent-cyan); color: #000; }
-.feed-section { background: var(--card-bg); border: 1px solid #282244; border-radius: 8px; padding: 15px; display: flex; flex-direction: column; height: 600px; }
-.feed-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
-.chat-feed { flex-grow: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-.chat-msg { background: rgba(255,255,255,0.03); padding: 8px 12px; border-radius: 6px; display: flex; align-items: center; gap: 10px; font-size: 0.9rem; }
-.chat-msg .p-icon { width: 18px; height: 18px; }
-.chat-msg .username { font-weight: bold; color: var(--accent-cyan); }
-.chat-msg .time { font-size: 0.75rem; color: var(--text-muted); margin-left: auto; }
+:root{--bg:#0b0916;--panel:#151128;--line:#2a2250;--acc:#8a2be2;--cy:#00f2fe;--tx:#f1f1f1;--mu:#9a98b0;--ok:#00ff88;--bad:#ff4757}
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',system-ui,sans-serif}
+body{background:radial-gradient(900px 400px at 10% -10%,#2a1260 0,transparent 60%),var(--bg);color:var(--tx);min-height:100vh;padding:20px}
+.wrap{max-width:1400px;margin:0 auto;display:grid;gap:16px}
+header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
+h1{font-size:1.7rem}h1 span{color:var(--cy)}.links{display:flex;gap:8px;flex-wrap:wrap}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.toolbar{display:flex;gap:22px;align-items:center;flex-wrap:wrap}.add{margin-left:auto;display:flex;gap:8px}
+select,input[type=text]{background:#0f0c20;border:1px solid var(--line);color:#fff;padding:9px 10px;border-radius:8px;width:100%}
+.btn{border:1px solid var(--line);background:#231b43;color:#ddd;padding:9px 14px;border-radius:8px;cursor:pointer;font-weight:600}
+.btn:hover{filter:brightness(1.2)}.btn.primary{background:var(--acc);border-color:var(--acc);color:#fff}.btn.ghost{background:transparent}
+.switch{display:flex;align-items:center;gap:10px;cursor:pointer;font-size:.92rem}.switch input{display:none}
+.switch i{width:40px;height:22px;background:#3a3160;border-radius:20px;position:relative;transition:.2s}
+.switch i:after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.2s}
+.switch input:checked+i{background:var(--acc)}.switch input:checked+i:after{left:21px}
+main{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){main{grid-template-columns:1fr}}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;align-content:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;display:grid;gap:10px}
+.ch{display:flex;align-items:center;gap:10px}.ch img{width:24px;height:24px}.ch h3{flex:1;font-size:.95rem;letter-spacing:.05em}
+.x{background:none;border:0;color:var(--mu);cursor:pointer;font-size:1.1rem}
+.badge{font-size:.7rem;padding:3px 9px;border-radius:12px;text-transform:uppercase;font-weight:700}
+.badge.connected{background:#00ff8826;color:var(--ok)}.badge.disconnected,.badge.error{background:#ff475726;color:var(--bad)}.badge.connecting{background:#ffa50026;color:orange}
+.row{display:flex;gap:8px}.row .btn{flex:1}.err{color:var(--bad);font-size:.78rem;word-break:break-word}.hint{color:var(--mu);font-size:.78rem}
+.feed{display:flex;flex-direction:column;height:620px}.fh{display:flex;align-items:center;gap:12px;margin-bottom:10px}.fh h2{font-size:1.05rem}.vc{margin-left:auto;color:var(--cy);font-size:.85rem}
+#feed{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+.m{background:#ffffff08;padding:7px 10px;border-radius:8px;display:flex;gap:8px;align-items:center;font-size:.9rem}
+.m img{width:18px;height:18px;border-radius:50%}.m b{color:var(--cy)}.m time{margin-left:auto;color:var(--mu);font-size:.72rem}
+.iconup{display:flex;align-items:center;gap:8px}.iconup img{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--line)}
