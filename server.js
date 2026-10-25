@@ -91,10 +91,10 @@ require('./adapters/xwebhook').init({
 
 // ---------------------------------------------------------------------------
 // Instagram live chat via Meta webhook (field: live_comments).
-//   env INSTAGRAM_VERIFY_TOKEN = any made-up word (also typed into Meta)
-//   env INSTAGRAM_APP_SECRET   = already used for the Instagram login
-//   env META_APP_SECRET        = optional, only if Meta signs with a different secret
-//   Callback URL in Meta: https://YOUR-HOST/webhooks/instagram
+//    env INSTAGRAM_VERIFY_TOKEN = any made-up word (also typed into Meta)
+//    env INSTAGRAM_APP_SECRET   = already used for the Instagram login
+//    env META_APP_SECRET        = optional, only if Meta signs with a different secret
+//    Callback URL in Meta: https://YOUR-HOST/webhooks/instagram
 // Comments go through broadcastMessage, so they reach the normal overlay AND
 // /api/chat/recent (the Synchra widget).
 // ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ function snapshot(platform) {
 // ---------------------------------------------------------------------------
 // Generic Python bridge runner (used by TikTok)
 // Bridge protocol: one JSON object per stdout line:
-//   {type:'log'|'status'|'message'|'error', ...}
+//    {type:'log'|'status'|'message'|'error', ...}
 // ---------------------------------------------------------------------------
 const BRIDGE_MAX_RETRIES = 8;
 
@@ -372,21 +372,16 @@ function startBridge(platform, script, arg, attempt = 0) {
 //   3. "api"       OFFICIAL: YouTube Data API v3 liveChatMessages.list, only
 //                  when YOUTUBE_API_KEY is set. Costs quota (see README note
 //                  in the deployment notes): every poll is 5 units.
-// The unofficial transports talk to undocumented endpoints. They work today
-// but can break whenever YouTube changes its pages; nothing here is a
-// guarantee. All parsing is defensive and every failure keeps its real reason.
 // ===========================================================================
-const YT_API_KEY = process.env.YOUTUBE_API_KEY || ''; // optional, official Data API v3
+const YT_API_KEY = process.env.YOUTUBE_API_KEY || '';
 const YT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const YT_VIDEO_ID = /^[\w-]{11}$/;
 const YT_CHANNEL_ID = /^UC[\w-]{22}$/;
 const YT_HANDLE = /^[\p{L}\p{N}._-]{3,30}$/u;
-const YT_STREAMS_TAB = 'EgdzdHJlYW1z8gYECgJ6AA%3D%3D'; // "streams" tab of a channel
+const YT_STREAMS_TAB = 'EgdzdHJlYW1z8gYECgJ6AA%3D%3D';
 
-// Tunables (exported through _test so unit tests can shrink the timings).
 const ytCfg = { timeScale: 1, maxChatChecks: 8, maxVideoRetries: 5, fetchTimeoutMs: 10000, maxStreams: 5, rescanMs: 90000 };
 
-// --- Errors ----------------------------------------------------------------
 const YT_PERMANENT = new Set(['NOT_FOUND', 'MEMBERS_ONLY', 'CHAT_DISABLED', 'INVALID_INPUT']);
 
 class YtError extends Error {
@@ -408,7 +403,6 @@ function ytHttpError(status, what = 'request') {
   return new YtError('HTTP', `${what} failed (HTTP ${s})`, { status: s });
 }
 
-// --- Input parsing ----------------------------------------------------------
 const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
 
 function youTubeTargets(input) {
@@ -435,7 +429,6 @@ function youTubeTargets(input) {
     if (m) { const h = safeDecode(m[1]); return YT_HANDLE.test(h) ? [handle(h)] : []; }
     m = u.pathname.match(/^\/channel\/(UC[\w-]{22})(?:[/?#]|$)/);
     if (m) return [channel(m[1])];
-    // Legacy /c/Name and /user/Name URLs: best effort, treated as a handle.
     m = u.pathname.match(/^\/(?:c|user)\/([^/]+)/);
     if (m) { const h = safeDecode(m[1]); return YT_HANDLE.test(h) ? [handle(h)] : []; }
     return [];
@@ -444,14 +437,12 @@ function youTubeTargets(input) {
   if (s.startsWith('@')) return YT_HANDLE.test(s.slice(1)) ? [handle(s.slice(1))] : [];
   if (YT_CHANNEL_ID.test(s)) return [channel(s)];
   if (YT_VIDEO_ID.test(s)) {
-    // 11 chars can be a video ID or a short handle. Real IDs usually contain A-Z, "-" or "_".
     return /[A-Z_-]/.test(s) ? [video(s), handle(s)] : [handle(s), video(s)];
   }
   if (YT_HANDLE.test(s)) return [handle(s)];
   return [];
 }
 
-// --- HTTP -------------------------------------------------------------------
 const ytWebHeaders = (extra = {}) => ({
   'User-Agent': YT_UA,
   'Accept-Language': 'en-US,en;q=0.9',
@@ -474,8 +465,6 @@ async function ytReadCapped(res, maxBytes) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-// fetch with timeout (covers the body read), size cap and external abort.
-// Never throws anything but YtError.
 async function ytFetch(url, { method = 'GET', headers = {}, body, timeout = ytCfg.fetchTimeoutMs, maxBytes = 4_000_000, signal } = {}) {
   const ctrl = new AbortController();
   let timedOut = false;
@@ -500,7 +489,6 @@ async function ytFetch(url, { method = 'GET', headers = {}, body, timeout = ytCf
   }
 }
 
-// Race a non-abortable promise (youtubei.js calls) against an abort signal.
 function ytAbortable(promise, signal) {
   if (!signal) return promise;
   return new Promise((resolve, reject) => {
@@ -514,7 +502,6 @@ function ytAbortable(promise, signal) {
   });
 }
 
-// Wraps youtubei.js errors so they carry a code (HTTP status when present).
 async function ytLib(fn, signal) {
   try {
     return await ytAbortable(Promise.resolve().then(fn), signal);
@@ -527,9 +514,6 @@ async function ytLib(fn, signal) {
   }
 }
 
-// youtubei.js is ESM-only, so it has to be imported dynamically. It is an
-// OPTIONAL helper: if it is missing or fails to initialise the server still
-// works through the plain-HTTP transports.
 let ytClientPromise = null;
 function getInnertube(fresh = false) {
   if (fresh) ytClientPromise = null;
@@ -543,12 +527,13 @@ function getInnertube(fresh = false) {
   }
   return ytClientPromise;
 }
+
 let ytLibWarnAt = 0;
 async function getInnertubeSafe() {
   try {
     return await getInnertube();
   } catch (err) {
-    if (Date.now() - ytLibWarnAt > 10 * 60000) { // warn once per 10 min, not on every retry
+    if (Date.now() - ytLibWarnAt > 10 * 60000) {
       ytLibWarnAt = Date.now();
       console.warn(`[YouTube] youtubei.js unavailable, continuing without it: ${err?.message || err}`);
     }
@@ -556,9 +541,7 @@ async function getInnertubeSafe() {
   }
 }
 
-// --- Small caches -----------------------------------------------------------
-const ytChannelCache = new Map(); // lowercase handle -> { id, exp }
-const ytDeadVideos = new Map();   // videoId -> expiry (known ended / not a livestream)
+const ytDeadVideos = new Map();
 
 function ytMarkDead(id, code) {
   const ttl = code === 'REPLAY' ? 30 * 60000 : code === 'NO_CHAT' || code === 'NOT_FOUND' ? 10 * 60000 : 0;
@@ -577,8 +560,6 @@ function ytIsDead(id) {
   return true;
 }
 
-// --- Generic JSON helpers ----------------------------------------------------
-// Extracts the first balanced {...} object starting at s[start].
 function ytBalancedObject(s, start) {
   if (s[start] !== '{') return null;
   let depth = 0;
@@ -598,7 +579,6 @@ function ytBalancedObject(s, start) {
   return null;
 }
 
-// Finds `ytInitialData = {...}` in any of the forms YouTube has used.
 function ytExtractInitialData(html) {
   if (typeof html !== 'string') return null;
   for (const marker of ['window["ytInitialData"]', 'var ytInitialData', 'ytInitialData']) {
@@ -611,16 +591,12 @@ function ytExtractInitialData(html) {
       if (!eq) continue;
       const json = ytBalancedObject(html, from + eq[0].length);
       if (!json) continue;
-      try { return JSON.parse(json); } catch { /* try next occurrence */ }
+      try { return JSON.parse(json); } catch {}
     }
   }
   return null;
 }
 
-const ytCfgValue = (html, name) => html.match(new RegExp(`"${name}"\\s*:\\s*"([^"]+)"`))?.[1] || '';
-
-// Walks a JSON tree (iteratively, with a node cap) and collects objects for
-// which `pick(node)` returns a value.
 function ytWalk(root, pick, cap = 60000) {
   const out = [];
   const stack = [root];
@@ -636,9 +612,6 @@ function ytWalk(root, pick, cap = 60000) {
   return out;
 }
 
-// --- Continuations ----------------------------------------------------------
-// Continuation data can sit in several shapes. Prefer the live-polling kinds;
-// "reload" is a last resort; the replay kind means the stream is over.
 const YT_CONT_KINDS = ['invalidationContinuationData', 'timedContinuationData', 'reloadContinuationData', 'liveChatReplayContinuationData'];
 
 function ytExtractContinuation(conts) {
@@ -654,15 +627,6 @@ function ytExtractContinuation(conts) {
   return null;
 }
 
-function ytFindLiveChatRenderer(data) {
-  const direct = data?.contents?.liveChatRenderer
-    || data?.contents?.twoColumnWatchNextResults?.conversationBar?.liveChatRenderer;
-  if (direct) return direct;
-  const found = ytWalk(data?.contents, (n) => n.liveChatRenderer, 20000);
-  return found[0] || null;
-}
-
-// --- Chat item parsing ------------------------------------------------------
 function ytText(t) {
   if (!t) return '';
   if (typeof t === 'string') return t;
@@ -691,15 +655,13 @@ function ytBadges(list) {
     .map((b) => b?.liveChatAuthorBadgeRenderer)
     .filter(Boolean)
     .map((b) => {
-      const icon = String(b.icon?.iconType || '').toLowerCase(); // owner | moderator | verified | verified_artist
+      const icon = String(b.icon?.iconType || '').toLowerCase();
       const thumbs = b.customThumbnail?.thumbnails;
-      const url = Array.isArray(thumbs) && thumbs.length ? thumbs[thumbs.length - 1]?.url || '' : ''; // member badge image
+      const url = Array.isArray(thumbs) && thumbs.length ? thumbs[thumbs.length - 1]?.url || '' : '';
       return { type: icon || (url ? 'member' : 'badge'), label: b.tooltip || icon || 'Member', url };
     });
 }
 
-// One chat item -> { key, message } or null. Returns null for item types
-// that are not chat messages (banners, placeholders, viewer engagement...).
 function ytItemToEntry(item) {
   if (!item || typeof item !== 'object') return null;
   let r;
@@ -756,7 +718,6 @@ function ytActionsToEntries(actions) {
   return out;
 }
 
-// Parses a get_live_chat response. Throws YtError for error payloads.
 function ytParseChatResponse(data) {
   if (!data || typeof data !== 'object') throw new YtError('PARSE', 'get_live_chat returned an unexpected payload');
   if (data.error) {
@@ -767,1272 +728,17 @@ function ytParseChatResponse(data) {
   const lcc = data.continuationContents?.liveChatContinuation;
   if (!lcc) return { entries: [], next: null, ended: false, reason: 'no liveChatContinuation' };
   const entries = ytActionsToEntries(lcc.actions);
-  const next = ytExtractContinuation(lcc.continuations);
-  if (next?.kind === 'liveChatReplayContinuationData') return { entries, next: null, ended: true, reason: 'replay' };
-  return { entries, next, ended: false };
-}
-
-// --- Chat start: popout page ------------------------------------------------
-const inactive = (code, reason) => ({ status: 'inactive', code, reason });
-
-function ytInactiveFromData(data) {
-  let blob = '';
-  try { blob = JSON.stringify(data?.contents || {}).slice(0, 30000); } catch {}
-  if (/members[- ]only|only (?:available to|for) (?:channel )?members/i.test(blob)) return inactive('MEMBERS_ONLY', 'chat is members-only');
-  if (/chat is disabled|chat has been (?:turned off|disabled)|chat is turned off|live chat is disabled/i.test(blob)) return inactive('CHAT_DISABLED', 'chat is disabled for this stream');
-  if (/video unavailable|private video|has been removed/i.test(blob)) return inactive('NOT_FOUND', 'video unavailable');
-  return inactive('NO_CHAT', 'no live chat on this video');
-}
-
-// Pure function (easy to unit test): page response -> active/inactive, or throws YtError.
-function ytAnalyzeChatPage(page) {
-  const { status, url, text } = page;
-  const consent = () => new YtError('CONSENT', 'YouTube served a cookie-consent page instead of the chat');
-  if (/consent\.(?:youtube|google)\.com/i.test(url || '')) throw consent();
-  if (status === 404 || status === 410) return inactive('NOT_FOUND', 'video not found');
-  if (status !== 200) throw ytHttpError(status, 'live chat page');
-
-  const data = ytExtractInitialData(text);
-  if (!data) {
-    if (/action="https:\/\/consent\.youtube\.com|Before you continue to YouTube/i.test(text || '')) throw consent();
-    throw new YtError('BAD_RESPONSE', 'live chat page had no chat data (layout changed or blocked page)');
-  }
-  const lc = ytFindLiveChatRenderer(data);
-  if (!lc) return ytInactiveFromData(data);
-  if (lc.isReplay) return inactive('REPLAY', 'only a chat replay (stream ended)');
-  const next = ytExtractContinuation(lc.continuations);
-  if (!next) return inactive('NO_CHAT', 'chat has no continuation (ended or unavailable)');
-  if (next.kind === 'liveChatReplayContinuationData') return inactive('REPLAY', 'only a chat replay (stream ended)');
-
-  const apiKey = ytCfgValue(text, 'INNERTUBE_API_KEY');
-  const clientVersion = ytCfgValue(text, 'INNERTUBE_CONTEXT_CLIENT_VERSION') || ytCfgValue(text, 'clientVersion');
-  if (!apiKey || !clientVersion) throw new YtError('BAD_RESPONSE', 'live chat page is missing the InnerTube key or client version');
-  const visitorData = ytCfgValue(text, 'visitorData') || ytCfgValue(text, 'VISITOR_DATA');
-
+  const cont = ytExtractContinuation(lcc.continuations);
+  const ended = !cont || cont.kind === 'liveChatReplayContinuationData';
   return {
-    status: 'active',
-    chat: {
-      mode: 'web',
-      next,
-      apiKey,
-      clientVersion,
-      visitorData,
-      seedKeys: ytActionsToEntries(lc.actions).map((e) => e.key)
-    }
+    entries,
+    next: cont?.token || null,
+    wait: cont?.wait || 1000,
+    ended,
+    reason: ended ? 'stream ended / replay' : (cont?.kind || 'ok')
   };
 }
 
-async function ytPopoutStart(videoId, signal) {
-  const page = await ytFetch(`https://www.youtube.com/live_chat?is_popout=1&v=${encodeURIComponent(videoId)}`, {
-    headers: ytWebHeaders(),
-    signal
-  });
-  return ytAnalyzeChatPage(page);
-}
-
-// --- Chat start: youtubei.js fallback ---------------------------------------
-async function ytNextStart(yt, videoId, signal) {
-  const res = await ytLib(() => yt.actions.execute('/next', { videoId }), signal);
-  const data = res?.data || res;
-  const lc = ytFindLiveChatRenderer(data);
-  if (!lc) return inactive('NO_CHAT', 'no live chat on this video');
-  if (lc.isReplay) return inactive('REPLAY', 'only a chat replay (stream ended)');
-  const next = ytExtractContinuation(lc.continuations);
-  if (!next || next.kind === 'liveChatReplayContinuationData') return inactive('NO_CHAT', 'chat has no continuation');
-  return { status: 'active', chat: { mode: 'innertube', next, seedKeys: ytActionsToEntries(lc.actions).map((e) => e.key) } };
-}
-
-// --- Official Data API (optional) -------------------------------------------
-async function ytApiJson(url, signal) {
-  const r = await ytFetch(url, { headers: { 'X-Goog-Api-Key': YT_API_KEY, Accept: 'application/json' }, signal, maxBytes: 2_000_000 });
-  let j = {};
-  try { j = JSON.parse(r.text); } catch { /* keep {} */ }
-  if (r.status >= 400) {
-    const reason = String(j?.error?.errors?.[0]?.reason || '');
-    let code = 'HTTP';
-    if (r.status === 429) code = 'RATE_LIMIT';
-    else if (r.status === 403) code = /liveChatEnded/i.test(reason) ? 'ENDED' : /liveChatDisabled/i.test(reason) ? 'CHAT_DISABLED' : /quota|rateLimit|dailyLimit/i.test(reason) ? 'RATE_LIMIT' : 'FORBIDDEN';
-    else if (r.status === 404) code = 'NOT_FOUND';
-    else if (r.status >= 500) code = 'SERVER';
-    throw new YtError(code, `YouTube API ${r.status}${reason ? ` (${reason})` : ''}: ${String(j?.error?.message || 'error').slice(0, 150)}`, { status: r.status });
-  }
-  return j;
-}
-
-async function ytApiStart(videoId, signal) {
-  const j = await ytApiJson(`https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=${encodeURIComponent(videoId)}`, signal);
-  const v = j.items?.[0];
-  if (!v) return inactive('NOT_FOUND', 'video not found');
-  const liveChatId = v.liveStreamingDetails?.activeLiveChatId;
-  if (v.snippet?.liveBroadcastContent !== 'live' || !liveChatId) {
-    return inactive(v.liveStreamingDetails?.actualEndTime ? 'REPLAY' : 'NO_CHAT', 'video is not live or has no active chat');
-  }
-  return { status: 'active', chat: { mode: 'api', liveChatId, next: { token: '', wait: 5000, kind: 'api' }, minWait: 5000, maxWait: 30000, seedKeys: [] } };
-}
-
-function ytApiItemToEntry(it) {
-  const sn = it?.snippet;
-  const au = it?.authorDetails || {};
-  if (!sn || !it.id) return null;
-  let text = '';
-  switch (sn.type) {
-    case 'textMessageEvent': text = sn.textMessageDetails?.messageText || sn.displayMessage || ''; if (!text) return null; break;
-    case 'superChatEvent': text = `\u{1F4B0} ${sn.superChatDetails?.amountDisplayString || ''} ${sn.superChatDetails?.userComment || ''}`.trim(); break;
-    case 'superStickerEvent': text = `\u{1F4B0} ${sn.superStickerDetails?.amountDisplayString || ''} [Super Sticker]`.trim(); break;
-    case 'newSponsorEvent': text = '\u2B50 New member'; break;
-    case 'memberMilestoneChatEvent': text = `\u2B50 ${sn.memberMilestoneChatDetails?.memberLevelName || 'Member'} ${sn.memberMilestoneChatDetails?.userComment || ''}`.trim(); break;
-    case 'membershipGiftingEvent': text = `\u{1F381} Gifted ${sn.membershipGiftingDetails?.giftMembershipsCount || ''} memberships`.replace(/\s+/g, ' ').trim(); break;
-    case 'giftMembershipReceivedEvent': text = '\u{1F381} Received a gifted membership'; break;
-    default: return null;
-  }
-  const badges = [];
-  if (au.isChatOwner) badges.push({ type: 'owner', label: 'Owner', url: '' });
-  if (au.isChatModerator) badges.push({ type: 'moderator', label: 'Moderator', url: '' });
-  if (au.isChatSponsor) badges.push({ type: 'member', label: 'Member', url: '' });
-  if (au.isVerified) badges.push({ type: 'verified', label: 'Verified', url: '' });
-  const key = `youtube-${it.id}`;
-  return { key, message: normalizeMessage('youtube', au.displayName || 'Viewer', text, au.profileImageUrl || '', key, badges) };
-}
-
-async function ytPollApi(chat, signal) {
-  const q = new URLSearchParams({ liveChatId: chat.liveChatId, part: 'snippet,authorDetails', maxResults: '200' });
-  if (chat.next.token) q.set('pageToken', chat.next.token);
-  const j = await ytApiJson(`https://www.googleapis.com/youtube/v3/liveChat/messages?${q}`, signal);
-  const entries = (j.items || []).map((it) => { try { return ytApiItemToEntry(it); } catch { return null; } }).filter(Boolean);
-  const next = typeof j.nextPageToken === 'string' && j.nextPageToken
-    ? { token: j.nextPageToken, wait: Number(j.pollingIntervalMillis) || 5000, kind: 'api' }
-    : null;
-  return { entries, next, ended: false };
-}
-
-// --- Chat polling over the web / innertube transports -----------------------
-async function ytPollWeb(chat, signal) {
-  const client = { clientName: 'WEB', clientVersion: chat.clientVersion, hl: 'en', gl: 'US' };
-  if (chat.visitorData) client.visitorData = chat.visitorData;
-  const r = await ytFetch(`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${encodeURIComponent(chat.apiKey)}&prettyPrint=false`, {
-    method: 'POST',
-    headers: ytWebHeaders({
-      'Content-Type': 'application/json',
-      Origin: 'https://www.youtube.com',
-      'X-Youtube-Client-Name': '1',
-      'X-Youtube-Client-Version': chat.clientVersion
-    }),
-    body: JSON.stringify({ context: { client }, continuation: chat.next.token }),
-    signal,
-    maxBytes: 2_000_000
-  });
-  if (r.status !== 200) {
-    const e = ytHttpError(r.status, 'get_live_chat');
-    try { const m = JSON.parse(r.text)?.error?.message; if (m) e.message += `: ${String(m).slice(0, 120)}`; } catch {}
-    throw e;
-  }
-  let data;
-  try { data = JSON.parse(r.text); } catch { throw new YtError('PARSE', 'get_live_chat returned invalid JSON'); }
-  return ytParseChatResponse(data);
-}
-
-const makeYtPollFn = (yt) => async (chat, signal) => {
-  if (chat.mode === 'api') return ytPollApi(chat, signal);
-  if (chat.mode === 'innertube' && yt) {
-    const res = await ytLib(() => yt.actions.execute('/live_chat/get_live_chat', { continuation: chat.next.token }), signal);
-    return ytParseChatResponse(res?.data || res);
-  }
-  return ytPollWeb(chat, signal);
-};
-
-// Tries every transport. Returns {status:'active', chat} or {status:'inactive', code, reason};
-// throws YtError when no transport could give a definitive answer.
-async function ytChatStart(videoId, { yt = null, signal } = {}) {
-  const errs = [];
-  const note = (label, e) => {
-    if (e?.code === 'ABORTED') throw e;
-    errs.push(e);
-    console.error(`[YouTube] ${label} failed for ${videoId}: ${e?.message || e}`);
-  };
-  try { return await ytPopoutStart(videoId, signal); } catch (e) { note('Popout chat page', e); }
-  if (yt) {
-    try { return await ytNextStart(yt, videoId, signal); } catch (e) { note('youtubei.js /next', e); }
-  }
-  if (YT_API_KEY) {
-    try { return await ytApiStart(videoId, signal); } catch (e) { note('Data API', e); }
-  }
-  const first = errs[0] || new YtError('NETWORK', 'no chat transport available');
-  throw new YtError(first.code, errs.map((e) => e?.message || e).join(' | '), { status: first.status });
-}
-
-function ytInactiveError(s) {
-  const code = s.code === 'REPLAY' ? 'NOT_LIVE' : s.code;
-  const msg = {
-    MEMBERS_ONLY: 'This live chat is members-only',
-    CHAT_DISABLED: 'Live chat is disabled for this stream',
-    NOT_FOUND: 'YouTube video not found',
-    NOT_LIVE: 'That video is not live (ended, or only a chat replay)',
-    NO_CHAT: 'That video has no live chat right now'
-  }[code] || s.reason || 'No live chat';
-  return new YtError(code, msg);
-}
-
-// --- Poller -----------------------------------------------------------------
-// One polling loop per instance: single timer, single in-flight request,
-// idempotent start(), stop() aborts the in-flight request and the timer.
-function createYtPoller({ chat, pollFn, onEntries, onEnd, seen, maxFailures = 6, log = console }) {
-  let stopped = false;
-  let running = false;
-  let started = false;
-  let timer = null;
-  let ctrl = null;
-  let firstPoll = true; // the first response is the backlog: remember it, do not replay it
-  let failures = 0;
-  let missing = 0;
-  const clamp = (n, lo, hi) => Math.min(Math.max(n, lo), hi);
-
-  for (const k of chat.seedKeys || []) seen(k);
-
-  const schedule = (ms) => {
-    if (stopped) return;
-    clearTimeout(timer);
-    timer = setTimeout(tick, Math.max(0, Math.round(ms * ytCfg.timeScale)));
-  };
-  const stop = () => {
-    stopped = true;
-    clearTimeout(timer);
-    try { ctrl?.abort(); } catch {}
-  };
-  const end = (reason, err, definitive) => {
-    if (stopped) return;
-    stop();
-    onEnd({ reason, err, definitive });
-  };
-
-  async function tick() {
-    if (stopped || running) return;
-    running = true;
-    ctrl = new AbortController();
-    let delay = 2000;
-    try {
-      const r = await pollFn(chat, ctrl.signal);
-      if (stopped) return;
-      failures = 0;
-
-      const fresh = [];
-      for (const e of r?.entries || []) {
-        if (e && !seen(e.key)) fresh.push(e.message);
-      }
-      if (!firstPoll && fresh.length) onEntries(fresh.slice(-100));
-      firstPoll = false;
-
-      if (r?.ended) return end('Stream ended', null, true);
-      if (r?.next && typeof r.next.token === 'string' && r.next.token) {
-        missing = 0;
-        chat.next = r.next;
-        delay = clamp(Number(r.next.wait) || 2000, chat.minWait ?? 1000, chat.maxWait ?? 10000);
-      } else {
-        // No continuation: retry the same token a couple of times before deciding the chat is over.
-        missing += 1;
-        log.warn?.(`[YouTube] Response had no continuation (${missing}/3)`);
-        if (missing >= 3) return end('Stream ended', null, true);
-        delay = 2000 * missing;
-      }
-    } catch (err) {
-      if (stopped || err?.code === 'ABORTED') return;
-      failures += 1;
-      log.error?.(`[YouTube] Chat poll failed (${failures}/${maxFailures}): ${err?.message || err}`);
-      if (err?.code === 'ENDED') return end('Stream ended', null, true);
-      if (err?.permanent) return end(err.message, err, false);
-      if (failures >= maxFailures) return end('Chat error', err, false);
-      delay = err?.code === 'RATE_LIMIT' || err?.code === 'FORBIDDEN'
-        ? Math.min(15000 * failures, 60000)
-        : Math.min(2000 * 2 ** (failures - 1), 30000);
-    } finally {
-      running = false;
-    }
-    schedule(delay);
-  }
-
-  return {
-    start() { if (started) return; started = true; tick(); },
-    stop,
-    get stopped() { return stopped; }
-  };
-}
-
-// --- Discovering the live video of a channel --------------------------------
-function ytRetryDelay(attempt, code) {
-  let base;
-  if (code === 'RATE_LIMIT' || code === 'FORBIDDEN' || code === 'CONSENT') base = Math.min(60000 * (attempt + 1), 300000);
-  else if (code === 'NOT_LIVE') base = [30000, 30000, 45000, 60000][Math.min(attempt, 3)];
-  else base = Math.min(10000 * 2 ** attempt, 120000);
-  return Math.round(base * (0.9 + Math.random() * 0.2));
-}
-
-async function ytChannelIdFromHandle(yt, handle, signal) {
-  const key = handle.toLowerCase();
-  const hit = ytChannelCache.get(key);
-  if (hit && hit.exp > Date.now()) return hit.id;
-  let id = null;
-  if (yt) {
-    try {
-      const ep = await ytLib(() => yt.resolveURL(`https://www.youtube.com/@${handle}`), signal);
-      id = ep?.payload?.browseId || null;
-    } catch (e) { if (e.code === 'ABORTED') throw e; }
-  }
-  if (!id || !YT_CHANNEL_ID.test(id)) {
-    id = null;
-    try {
-      const p = await ytFetch(`https://www.youtube.com/@${encodeURIComponent(handle)}`, { headers: ytWebHeaders(), signal });
-      // Prefer the page's own identity fields over generic "browseId" hits,
-      // which can belong to recommended channels.
-      id = p.text.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/)?.[1]
-        || p.text.match(/itemprop="(?:channelId|identifier)" content="(UC[\w-]{22})"/)?.[1]
-        || p.text.match(/"externalId":"(UC[\w-]{22})"/)?.[1]
-        || p.text.match(/"channelId":"(UC[\w-]{22})"/)?.[1]
-        || null;
-    } catch (e) { if (e.code === 'ABORTED') throw e; }
-  }
-  if (id) {
-    if (ytChannelCache.size > 50) ytChannelCache.delete(ytChannelCache.keys().next().value);
-    ytChannelCache.set(key, { id, exp: Date.now() + 6 * 3600000 });
-  }
-  return id;
-}
-
-// <channel>/live redirects to the current stream when there is one.
-async function ytLivePage(pathPart, signal) {
-  const p = await ytFetch(`https://www.youtube.com/${pathPart}/live`, { headers: ytWebHeaders(), signal });
-  if (/consent\.(?:youtube|google)\.com/i.test(p.url)) throw new YtError('CONSENT', 'YouTube served a cookie-consent page for the /live check');
-  if (p.status === 404) throw new YtError('NOT_FOUND', 'YouTube channel not found');
-  if (p.status !== 200) throw ytHttpError(p.status, '/live page');
-  const id = p.url.match(/[?&]v=([\w-]{11})/)?.[1]
-    || p.text.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([\w-]{11})"/)?.[1]
-    || null;
-  let confirmed = false;
-  if (id) {
-    const i = p.text.indexOf(`"videoDetails":{"videoId":"${id}"`);
-    if (i !== -1) confirmed = /"isLive(?:Now)?":true/.test(p.text.slice(i, i + 4000));
-  }
-  console.log(`[YouTube] /live page ${pathPart}: HTTP ${p.status}, ${p.text.length} bytes, video ${id || 'none'}${confirmed ? ' (live)' : ''}`);
-  return { id, confirmed };
-}
-
-// Structural walk of a browse response instead of regexing around ids.
-function ytCollectVideos(root) {
-  const seen = new Set();
-  const list = [];
-  ytWalk(root, (n) => {
-    let id = null;
-    let live = false;
-    if (typeof n.videoId === 'string' && (n.thumbnailOverlays || n.badges || n.title)) {
-      id = n.videoId;
-      live = /BADGE_STYLE_TYPE_LIVE_NOW|"style":"LIVE"|LIVE_NOW/.test(JSON.stringify([n.badges, n.thumbnailOverlays]));
-    } else if (typeof n.contentId === 'string' && n.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO') {
-      id = n.contentId;
-      live = /LIVE_NOW|"text":"LIVE"|"style":"LIVE"/i.test(JSON.stringify(n.contentImage || {}));
-    }
-    if (id && !live && /upcomingEventData|UPCOMING/.test(JSON.stringify(n).slice(0, 6000))) id = null; // scheduled, not live yet
-    if (id && YT_VIDEO_ID.test(id) && !seen.has(id)) { seen.add(id); list.push({ id, live }); }
-    return null;
-  });
-  return list;
-}
-
-async function ytStreamsTabIds(yt, channelId, signal) {
-  if (!yt) return [];
-  const res = await ytLib(() => yt.actions.execute('/browse', { browseId: channelId, params: YT_STREAMS_TAB }), signal);
-  const vids = ytCollectVideos(res?.data || res);
-  console.log(`[YouTube] Streams tab ${channelId}: ${vids.length} video(s), ${vids.filter((v) => v.live).length} flagged live`);
-  return [...vids.filter((v) => v.live), ...vids.filter((v) => !v.live)].slice(0, 6);
-}
-
-async function ytInnertubeChannelIds(yt, channelId, signal) {
-  if (!yt) return [];
-  const channel = await ytLib(() => yt.getChannel(channelId), signal);
-  const out = [];
-  const idOf = (v) => v?.video_id || v?.id || v?.content_id;
-  const isLive = (v) => v?.is_live === true || (v?.badges || []).some?.((b) => /LIVE_NOW/i.test(String(b?.style || b?.label || '')));
-  for (const v of channel.videos || []) if (isLive(v) && YT_VIDEO_ID.test(String(idOf(v)))) out.push({ id: idOf(v), live: true });
-  if (channel.has_live_streams) {
-    const vids = (await ytLib(() => channel.getLiveStreams(), signal)).videos || [];
-    for (const v of vids.slice(0, 6)) if (YT_VIDEO_ID.test(String(idOf(v)))) out.push({ id: idOf(v), live: isLive(v) });
-  }
-  console.log(`[YouTube] Innertube channel ${channelId}: ${out.length} candidate(s)`);
-  return out.sort((a, b) => Number(b.live) - Number(a.live));
-}
-
-// RSS feed lists a channel's newest uploads and streams.
-async function ytFeedVideoIds(channelId, signal) {
-  const r = await ytFetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`, {
-    headers: { 'User-Agent': 'Mozilla/5.0' },
-    signal,
-    maxBytes: 500_000
-  });
-  if (r.status !== 200) throw ytHttpError(r.status, 'RSS feed');
-  const ids = [...r.text.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)].map((m) => m[1]).slice(0, 5);
-  console.log(`[YouTube] RSS feed ${channelId}: ${ids.length} video(s)`);
-  return ids;
-}
-
-// Optional official API: 2 quota units per check. The key travels in a
-// header so it never appears in URLs or error messages.
-async function ytApiLiveIds(channelId, signal) {
-  if (!YT_API_KEY || !YT_CHANNEL_ID.test(channelId)) return [];
-  const pl = await ytApiJson(`https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=8&playlistId=UU${channelId.slice(2)}`, signal);
-  const ids = (pl.items || []).map((i) => i.contentDetails?.videoId).filter((x) => YT_VIDEO_ID.test(String(x)));
-  if (!ids.length) return [];
-  const v = await ytApiJson(`https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${ids.join(',')}`, signal);
-  const live = (v.items || []).filter((x) => x.snippet?.liveBroadcastContent === 'live').map((x) => x.id);
-  console.log(`[YouTube] Data API ${channelId}: ${ids.length} recent upload(s), ${live.length} live`);
-  return live;
-}
-
-// Staged discovery: cheap, most reliable sources first; later (heavier)
-// stages only run if earlier ones produced no verified live chat. At most
-// ytCfg.maxChatChecks chat pages are downloaded per discovery run.
-// Returns { videoId, chat } (or an array of them with {all:true}) or throws YtError.
-async function ytFindLive(yt, t, signal, { all = false, skip = null } = {}) {
-  const tried = new Set(skip || []); // streams already connected are not checked again
-  const results = [];
-  let checks = 0;
-  let lastErr = null;
-  let blockedErr = null;
-  let sawData = false;
-  let channelId = t.type === 'channel' ? t.value : null;
-  let channelResolved = t.type === 'channel';
-  const pathPart = t.type === 'handle' ? `@${encodeURIComponent(t.value)}` : `channel/${t.value}`;
-
-  const getChannelId = async () => {
-    if (!channelResolved) {
-      channelId = await ytChannelIdFromHandle(yt, t.value, signal);
-      channelResolved = true;
-      console.log(`[YouTube] ${t.label}: channel id ${channelId || 'NOT RESOLVED'}`);
-    }
-    return channelId;
-  };
-
-  const weakAll = [];
-  const verify = async (cands, collect = all) => {
-    for (const c of cands) {
-      if (!YT_VIDEO_ID.test(String(c.id)) || tried.has(c.id) || ytIsDead(c.id)) continue;
-      if (checks >= ytCfg.maxChatChecks) return null;
-      tried.add(c.id);
-      checks += 1;
-      try {
-        const s = await ytChatStart(c.id, { yt, signal });
-        sawData = true;
-        if (s.status === 'active') {
-          console.log(`[YouTube] ${t.label}: active live chat on ${c.id} via ${c.src} (${s.chat.mode})`);
-          if (!collect) return { videoId: c.id, chat: s.chat };
-          results.push({ videoId: c.id, chat: s.chat });
-          continue;
-        }
-        ytMarkDead(c.id, s.code);
-        if (s.code === 'MEMBERS_ONLY' || s.code === 'CHAT_DISABLED') blockedErr = ytInactiveError(s);
-      } catch (e) {
-        if (e.code === 'ABORTED') throw e;
-        lastErr = e;
-        // Blocked / rate-limited / consent affects every candidate equally: stop hammering.
-        if (['RATE_LIMIT', 'FORBIDDEN', 'CONSENT'].includes(e.code)) throw e;
-      }
-    }
-    return null;
-  };
-
-  const stages = [
-    async () => {
-      const r = await ytLivePage(pathPart, signal);
-      sawData = true;
-      return r.id ? [{ id: r.id, src: '/live page', live: r.confirmed }] : [];
-    },
-    async () => ((await getChannelId()) ? (await ytApiLiveIds(channelId, signal)).map((id) => ({ id, src: 'Data API', live: true })) : []),
-    async () => ((await getChannelId()) ? (await ytStreamsTabIds(yt, channelId, signal)).map((v) => ({ id: v.id, src: 'streams tab', live: v.live })) : []),
-    async () => ((await getChannelId()) ? (await ytInnertubeChannelIds(yt, channelId, signal)).map((v) => ({ id: v.id, src: 'Innertube channel', live: v.live })) : []),
-    async () => ((await getChannelId()) ? (await ytFeedVideoIds(channelId, signal)).map((id) => ({ id, src: 'RSS feed' })) : [])
-  ];
-
-  for (const stage of stages) {
-    let cands = [];
-    try {
-      cands = await stage();
-    } catch (e) {
-      if (e.code === 'ABORTED' || e.code === 'NOT_FOUND') throw e;
-      lastErr = e;
-      console.error(`[YouTube] ${t.label}: discovery step failed: ${e?.message || e}`);
-    }
-    // Confirmed-live candidates are verified first.
-    cands.sort((a, b) => Number(!!b.live) - Number(!!a.live));
-    if (all) {
-      // Multi-stream mode: only candidates flagged live are connected. Unflagged
-      // ones (RSS, old uploads, scheduled streams) are a last resort below.
-      weakAll.push(...cands.filter((c) => !c.live));
-      await verify(cands.filter((c) => c.live));
-      if (checks >= ytCfg.maxChatChecks) break;
-      continue;
-    }
-    const found = await verify(cands);
-    if (found) return found;
-    if (checks >= ytCfg.maxChatChecks) break;
-  }
-
-  if (all && results.length) return results; // every verified live stream of the channel
-  if (all && weakAll.length) {
-    const one = await verify(weakAll, false); // nothing flagged live: fall back to the first active chat
-    if (one) return [one];
-  }
-  if (blockedErr) throw blockedErr;
-  if (!sawData && lastErr) throw lastErr; // show the real reason (e.g. 403) instead of "not live"
-  throw new YtError('NOT_LIVE', `${t.label} is not live right now`);
-}
-
-async function ytStartVideo(yt, videoId, signal) {
-  const s = await ytChatStart(videoId, { yt, signal });
-  if (s.status === 'active') return { videoId, chat: s.chat };
-  ytMarkDead(videoId, s.code);
-  throw ytInactiveError(s);
-}
-
-// --- Connection lifecycle ---------------------------------------------------
-async function connectYouTube(input) {
-  disconnectPlatform('youtube'); // stops the previous session, timers and in-flight requests
-  const targets = youTubeTargets(input);
-  if (!targets.length) {
-    return updatePlatformStatus('youtube', 'error', String(input).slice(0, 80), 'Use a @handle, channel URL, or video URL/ID');
-  }
-  const token = Symbol('yt');
-  const session = {
-    ctrl: new AbortController(),
-    streams: new Map(),   // videoId -> poller (one polling loop per live stream)
-    seen: makeSeen(3000), // shared de-duplication across all streams of this connection
-    scanTimer: null,
-    stop() {
-      this.ctrl.abort();
-      clearTimeout(this.scanTimer);
-      for (const p of this.streams.values()) p.stop();
-      this.streams.clear();
-    }
-  };
-  const a = activeAdapters.youtube;
-  a.token = token;
-  a.instance = session;
-  const label = targets[0].label;
-  console.log(`[YouTube] Connecting: ${targets.map((t) => `${t.type}:${t.value}`).join(', ')}`);
-  updatePlatformStatus('youtube', 'connecting', label);
-  const ctx = { targets, token, label, session, attempt: 0, running: false, watching: targets.some((t) => t.type !== 'video') };
-  runYouTube(ctx).catch((err) => {
-    console.error('[YouTube] Unexpected failure:', err);
-    if (activeAdapters.youtube.token === token) updatePlatformStatus('youtube', 'error', label, String(err?.message || err));
-  });
-}
-
-const YT_RANK = { NOT_LIVE: 6, NETWORK: 5, TIMEOUT: 5, SERVER: 5, RATE_LIMIT: 5, FORBIDDEN: 5, CONSENT: 5, BAD_RESPONSE: 5, MEMBERS_ONLY: 4, CHAT_DISABLED: 4, NO_CHAT: 3, NOT_FOUND: 1 };
-const bestYtError = (errs) => errs.slice().sort((a, b) => (YT_RANK[b.code] || 2) - (YT_RANK[a.code] || 2))[0];
-
-async function runYouTube(ctx) {
-  if (ctx.running) return; // never two discovery runs at once for one connection
-  ctx.running = true;
-  try {
-    await runYouTubeOnce(ctx);
-  } finally {
-    ctx.running = false;
-  }
-}
-
-async function runYouTubeOnce(ctx) {
-  const { targets, token, label, session, watching } = ctx;
-  const adapter = () => activeAdapters.youtube;
-  const current = () => adapter().token === token && !session.ctrl.signal.aborted;
-
-  const fail = (msg) => {
-    console.error(`[YouTube] ${msg}`);
-    if (!current()) return;
-    session.stop();
-    updatePlatformStatus('youtube', 'error', label, msg);
-  };
-
-  const retryLater = (err) => {
-    if (!current()) return;
-    const code = err?.code || 'NOT_LIVE';
-    const why = String(err?.message || 'Not live');
-    ctx.attempt += 1;
-    if (!watching && ctx.attempt > ytCfg.maxVideoRetries) return fail(why);
-    const blocked = code === 'MEMBERS_ONLY' || code === 'CHAT_DISABLED';
-    const delay = Math.round((blocked ? 300000 : ytRetryDelay(ctx.attempt - 1, code)) * ytCfg.timeScale);
-    console.log(`[YouTube] ${why}. Checking again in ${Math.round(delay / 1000)}s`);
-    if (blocked || code === 'FORBIDDEN' || code === 'RATE_LIMIT' || code === 'CONSENT') {
-      updatePlatformStatus('youtube', 'error', label, why);
-    } else {
-      updatePlatformStatus('youtube', 'connecting', `${label} (${why.slice(0, 80)})`);
-    }
-    clearTimeout(adapter().retry);
-    adapter().retry = setTimeout(() => {
-      runYouTube(ctx).catch((e) => console.error('[YouTube] Retry crashed:', e));
-    }, delay);
-  };
-
-  const handleFailure = (err) => {
-    if (err?.code === 'ABORTED' || !current()) return;
-    if (watching) {
-      // A typo'd handle will never work; everything else is worth retrying.
-      if (err.code === 'NOT_FOUND' && targets.every((t) => t.type !== 'video')) return fail(err.message);
-      return retryLater(err);
-    }
-    if (err.permanent || err.code === 'NOT_LIVE' || err.code === 'NO_CHAT') return fail(err.message);
-    return retryLater(err); // transient (network, 403, 5xx...): bounded retries
-  };
-
-  // While watching a channel we keep rescanning, so streams that go live later
-  // (or a second simultaneous stream) are picked up without a reconnect.
-  const scheduleRescan = () => {
-    if (!watching || !current()) return;
-    clearTimeout(session.scanTimer);
-    session.scanTimer = setTimeout(() => {
-      runYouTube(ctx).catch((e) => console.error('[YouTube] Rescan crashed:', e));
-    }, Math.round(ytCfg.rescanMs * ytCfg.timeScale));
-  };
-
-  const announce = () => updatePlatformStatus('youtube', 'connected', session.streams.size > 1 ? `${label} (${session.streams.size} live)` : label);
-
-  try {
-    const yt = await getInnertubeSafe();
-    if (!current()) return;
-
-    const startStream = (found) => {
-      const { videoId } = found;
-      if (session.streams.has(videoId) || session.streams.size >= ytCfg.maxStreams) return false;
-      const poller = createYtPoller({
-        chat: found.chat,
-        pollFn: makeYtPollFn(yt),
-        seen: session.seen,
-        onEntries: (msgs) => {
-          if (!current() || session.streams.get(videoId) !== poller) return; // an older connection must never broadcast
-          for (const m of msgs) {
-            try { broadcastMessage(m); } catch (err) { console.error('[YouTube] broadcast failed:', err); }
-          }
-        },
-        onEnd: ({ reason, err, definitive }) => {
-          if (session.streams.get(videoId) === poller) session.streams.delete(videoId);
-          if (definitive) ytMarkDead(videoId, 'REPLAY');
-          console.log(`[YouTube] Chat of ${videoId} stopped: ${reason}`);
-          if (!current()) return;
-          if (session.streams.size > 0) return announce(); // other streams keep running
-          clearTimeout(session.scanTimer);
-          if (watching) return retryLater(err instanceof YtError ? err : new YtError('NOT_LIVE', reason));
-          if (err) return fail(String(err?.message || err));
-          updatePlatformStatus('youtube', 'disconnected');
-        }
-      });
-      session.streams.set(videoId, poller);
-      console.log(`[YouTube] Connected to live chat of video ${videoId} (${found.chat.mode})`);
-      poller.start();
-      return true;
-    };
-
-    const rescan = session.streams.size > 0;
-    let foundList = [];
-    const errs = [];
-    for (const t of targets) {
-      try {
-        if (t.type === 'video') {
-          if (rescan) continue;
-          foundList = [await ytStartVideo(yt, t.value, session.ctrl.signal)];
-        } else {
-          foundList = await ytFindLive(yt, t, session.ctrl.signal, { all: true, skip: session.streams.keys() });
-        }
-        if (foundList.length) break;
-      } catch (e) {
-        if (e?.code === 'ABORTED') return;
-        errs.push(e instanceof YtError ? e : new YtError('NETWORK', String(e?.message || e)));
-      }
-    }
-    if (!current()) return;
-
-    if (!foundList.length) {
-      if (rescan) return scheduleRescan(); // nothing new; existing streams keep running
-      return handleFailure(bestYtError(errs) || new YtError('NOT_LIVE', `${label} is not live right now`));
-    }
-
-    ctx.attempt = 0;
-    let started = 0;
-    for (const f of foundList) if (startStream(f)) started += 1;
-    if (started) announce();
-    scheduleRescan();
-  } catch (err) {
-    if (err?.code === 'ABORTED') return;
-    console.error('[YouTube] Connect failed:', err?.message || err);
-    ytClientPromise = null;
-    if (session.streams.size > 0) return scheduleRescan();
-    handleFailure(err instanceof YtError ? err : new YtError('NETWORK', String(err?.message || err)));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 2. TikTok (Python bridge)
-// ---------------------------------------------------------------------------
-function connectTikTok(username) {
-  disconnectPlatform('tiktok');
-  if (!settings.tiktokEnabled) return updatePlatformStatus('tiktok', 'error', String(username), 'TikTok is switched off');
-  const user = String(username || '').replace(/^@/, '').trim();
-  if (!/^[A-Za-z0-9][A-Za-z0-9._]{0,39}$/.test(user)) {
-    return updatePlatformStatus('tiktok', 'error', String(username), 'Invalid TikTok username');
-  }
-  startBridge('tiktok', 'tiktok_bridge.py', user);
-}
-
-// ---------------------------------------------------------------------------
-// 3. Twitch
-//
-// Badge images: the old https://badges.twitch.tv endpoint was permanently shut
-// down (June 2023). Badge images now come from Helix (Get Global / Channel Chat
-// Badges), which needs an app access token:
-//     env TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET   (dev.twitch.tv/console)
-// Without those, the community IVR API (api.ivr.fi) is used as a fallback.
-// ---------------------------------------------------------------------------
-const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
-const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
-const TWITCH_BADGE_TTL_MS = 60 * 60 * 1000; // good result: keep 1 h
-const TWITCH_BADGE_FAIL_MS = 60 * 1000;     // failure: retry after 1 min
-const twitchBadgeCache = new Map();         // key -> { at, ttl, p }
-let twitchTok = { value: null, exp: 0 };
-
-async function twitchAppToken() {
-  if (twitchTok.value && Date.now() < twitchTok.exp - 60000) return twitchTok.value;
-  const res = await fetch('https://id.twitch.tv/oauth2/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: TWITCH_CLIENT_ID,
-      client_secret: TWITCH_CLIENT_SECRET,
-      grant_type: 'client_credentials'
-    }),
-    signal: AbortSignal.timeout(8000)
-  });
-  const j = await res.json().catch(() => ({}));
-  if (!res.ok || !j.access_token) throw new Error(`Twitch auth failed (${res.status}): ${j.message || 'error'}`);
-  twitchTok = { value: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
-  return twitchTok.value;
-}
-
-// Helix ({set_id, versions}) and IVR ({setID, versions}) -> { set: { versions: { id: {...} } } }
-function normBadgeSets(list) {
-  const out = {};
-  for (const s of Array.isArray(list) ? list : []) {
-    const id = s?.set_id || s?.setID;
-    if (!id) continue;
-    const versions = {};
-    for (const v of s.versions || []) {
-      versions[String(v.id ?? v.version)] = {
-        title: v.title,
-        image_url_1x: v.image_url_1x,
-        image_url_2x: v.image_url_2x
-      };
-    }
-    out[id] = { versions };
-  }
-  return out;
-}
-
-async function twitchJson(url, headers) {
-  const r = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
-
-async function loadTwitchBadges(scope, roomId, login) {
-  if (TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET) {
-    try {
-      const token = await twitchAppToken();
-      const url = scope === 'global'
-        ? 'https://api.twitch.tv/helix/chat/badges/global'
-        : `https://api.twitch.tv/helix/chat/badges?broadcaster_id=${encodeURIComponent(roomId)}`;
-      const j = await twitchJson(url, { Authorization: `Bearer ${token}`, 'Client-Id': TWITCH_CLIENT_ID });
-      return normBadgeSets(j.data);
-    } catch (err) {
-      console.error(`[Twitch] Helix ${scope} badges failed:`, err?.message || err);
-      twitchTok = { value: null, exp: 0 };
-    }
-  }
-  // Fallback without credentials (third-party, community run).
-  try {
-    const url = scope === 'global'
-      ? 'https://api.ivr.fi/v2/twitch/badges/global'
-      : `https://api.ivr.fi/v2/twitch/badges/channel?login=${encodeURIComponent(login)}`;
-    return normBadgeSets(await twitchJson(url, { Accept: 'application/json' }));
-  } catch (err) {
-    console.error(`[Twitch] IVR ${scope} badges failed:`, err?.message || err);
-    return null;
-  }
-}
-
-function twitchBadgeSets(scope, roomId = '', login = '') {
-  const key = scope === 'global' ? 'global' : `channel:${roomId}`;
-  const hit = twitchBadgeCache.get(key);
-  if (hit && Date.now() - hit.at < hit.ttl) return hit.p;
-  const entry = { at: Date.now(), ttl: TWITCH_BADGE_TTL_MS, p: null };
-  entry.p = loadTwitchBadges(scope, roomId, login).then((v) => {
-    if (!v) { entry.ttl = TWITCH_BADGE_FAIL_MS; return {}; }
-    console.log(`[Twitch] Loaded ${scope} badge sets: ${Object.keys(v).length}`);
-    return v;
-  });
-  twitchBadgeCache.set(key, entry);
-  if (twitchBadgeCache.size > 100) twitchBadgeCache.delete(twitchBadgeCache.keys().next().value); // bound memory
-  return entry.p;
-}
-
-// tags.badges looks like { moderator: '1', subscriber: '12' }.
-// Channel sets override global ones (custom sub / bits badges).
-async function twitchBadges(tags, login = '') {
-  const raw = tags.badges;
-  if (!raw || typeof raw !== 'object') return [];
-  const room = tags['room-id'];
-  const [glob, chan] = await Promise.all([
-    twitchBadgeSets('global'),
-    room ? twitchBadgeSets('channel', room, login) : {}
-  ]);
-  return Object.entries(raw).map(([name, version]) => {
-    const v = chan[name]?.versions?.[version] || glob[name]?.versions?.[version];
-    return { type: name, label: v?.title || name, url: v?.image_url_2x || v?.image_url_1x || '' };
-  });
-}
-
-async function connectTwitch(channel) {
-  disconnectPlatform('twitch');
-  const chan = String(channel || '').replace(/^#/, '').trim().toLowerCase();
-  if (!/^[a-z0-9_]{3,25}$/.test(chan)) {
-    return updatePlatformStatus('twitch', 'error', String(channel), 'Invalid Twitch channel');
-  }
-
-  updatePlatformStatus('twitch', 'connecting', chan);
-  const client = new tmi.Client({ channels: [chan] });
-  activeAdapters.twitch.client = client;
-  const isCurrent = () => activeAdapters.twitch.client === client;
-
-  client.on('message', async (_c, tags, message, self) => {
-    if (self || !isCurrent()) return;
-    let badges = [];
-    try { badges = await twitchBadges(tags, chan); } catch {}
-    if (!isCurrent()) return;
-    broadcastMessage(normalizeMessage('twitch', tags['display-name'] || tags.username, message, '', tags.id ? `twitch-${tags.id}` : null, badges));
-  });
-  client.on('disconnected', () => {
-    if (isCurrent() && activeAdapters.twitch.status !== 'error') updatePlatformStatus('twitch', 'disconnected');
-  });
-  client.on('connected', () => {
-    if (isCurrent()) { updatePlatformStatus('twitch', 'connected', chan); fetchTwitchIcon(chan); }
-  });
-
-  try {
-    await client.connect();
-  } catch (err) {
-    if (isCurrent()) updatePlatformStatus('twitch', 'error', chan, String(err?.message || err));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 4. Kick: official API + webhooks.
-// Setup: https://kick.com/settings/developer -> create an app, then set
-//   env KICK_CLIENT_ID, KICK_CLIENT_SECRET
-//   Webhook URL in the Kick app settings: https://YOUR-HOST/webhooks/kick
-// Kick badges come as { type, text, count? } with no image URL, so the overlay
-// has to draw them by `type` (moderator, subscriber, sub_gifter, vip, og, ...).
-// ---------------------------------------------------------------------------
-const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID;
-const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET;
-const KICK_API = 'https://api.kick.com/public/v1';
-let kickToken = { value: null, exp: 0 };
-let kickPublicKeyPem = null;
-const kickSeen = makeSeen(1000);
-
-async function kickAppToken(force = false) {
-  if (!force && kickToken.value && Date.now() < kickToken.exp - 60000) return kickToken.value;
-  const res = await fetch('https://id.kick.com/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: KICK_CLIENT_ID,
-      client_secret: KICK_CLIENT_SECRET
-    }),
-    signal: AbortSignal.timeout(10000)
-  });
-  const j = await res.json().catch(() => ({}));
-  if (!res.ok || !j.access_token) {
-    throw new Error(`Kick auth failed (${res.status}): ${j.error_description || j.error || j.message || 'unknown error'}`);
-  }
-  kickToken = { value: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
-  return kickToken.value;
-}
-
-async function kickApi(method, pathAndQuery, body, retried = false) {
-  const token = await kickAppToken(retried);
-  const res = await fetch(KICK_API + pathAndQuery, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      ...(body ? { 'Content-Type': 'application/json' } : {})
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(10000)
-  });
-  if (res.status === 401 && !retried) return kickApi(method, pathAndQuery, body, true);
-  const j = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Kick API ${method} ${pathAndQuery.split('?')[0]} -> ${res.status}: ${j.message || j.error || 'error'}`);
-  return j;
-}
-
-// Kick's webhook sends badges as { type, text, count? } without images, and
-// Kick's own role badges are bundled inside its website (no public URL). So:
-//  - role badges use the icons in public/icons/kick/ (served by this server)
-//  - the channel's custom subscriber badges are fetched best-effort from Kick's
-//    unofficial website API (may be blocked; falls back to the local icon)
-const KICK_ICON_FILES = new Set(['broadcaster', 'moderator', 'vip', 'og', 'founder', 'subscriber', 'staff', 'verified', 'subgifter', 'sidekick']);
-
-function kickBadgeIcon(type, count) {
-  const key = String(type || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const k = key === 'owner' ? 'broadcaster' : key === 'mod' ? 'moderator' : key;
-  if (k === 'subgifter') {
-    const tier = [200, 100, 50, 25].find((t) => Number(count) >= t);
-    return `/icons/kick/subgifter${tier || ''}.svg`;
-  }
-  return KICK_ICON_FILES.has(k) ? `/icons/kick/${k}.svg` : '/icons/kick/unknown.svg';
-}
-
-async function kickChannelSubBadges(slug) {
-  try {
-    const r = await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, {
-      headers: { Accept: 'application/json', 'User-Agent': YT_UA },
-      signal: AbortSignal.timeout(8000)
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
-    const list = (j.subscriber_badges || [])
-      .map((b) => ({ months: Number(b.months) || 0, url: b.badge_image?.src || '' }))
-      .filter((b) => /^https:\/\//i.test(b.url))
-      .sort((a, b) => a.months - b.months);
-    console.log(`[Kick] ${slug}: ${list.length} custom subscriber badge(s)`);
-    return list;
-  } catch (err) {
-    console.log(`[Kick] Custom sub badges unavailable for ${slug} (${err?.message || err}); using default icons`);
-    return [];
-  }
-}
-
-function kickSubBadgeUrl(list, months) {
-  if (!list?.length) return '';
-  const m = Number(months) || 0;
-  let pick = list[0];
-  for (const b of list) if (b.months <= m) pick = b;
-  return pick.url;
-}
-
-async function connectKick(slug) {
-  disconnectPlatform('kick');
-  const clean = String(slug || '').toLowerCase().trim().replace(/^@/, '');
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(clean)) {
-    return updatePlatformStatus('kick', 'error', String(slug), 'Invalid Kick channel name');
-  }
-  if (!KICK_CLIENT_ID || !KICK_CLIENT_SECRET) {
-    return updatePlatformStatus('kick', 'error', clean, 'Set KICK_CLIENT_ID and KICK_CLIENT_SECRET in the server environment');
-  }
-
-  const token = Symbol('kick');
-  activeAdapters.kick.token = token;
-  updatePlatformStatus('kick', 'connecting', clean);
-
-  try {
-    const ch = await kickApi('GET', `/channels?slug=${encodeURIComponent(clean)}`);
-    const broadcasterId = Number(ch?.data?.[0]?.broadcaster_user_id);
-    if (!broadcasterId) throw new Error(`Kick channel "${clean}" not found`);
-    console.log(`[Kick] Channel ${clean} -> broadcaster_user_id ${broadcasterId}`);
-
-    const subs = await kickApi('GET', '/events/subscriptions');
-    const exists = (subs.data || []).some(
-      (s) => s.event === 'chat.message.sent' && Number(s.broadcaster_user_id) === broadcasterId
-    );
-    if (!exists) {
-      const r = await kickApi('POST', '/events/subscriptions', {
-        broadcaster_user_id: broadcasterId,
-        events: [{ name: 'chat.message.sent', version: 1 }],
-        method: 'webhook'
-      });
-      const bad = (r.data || []).find((d) => d.error);
-      if (bad) throw new Error(`Subscription refused: ${bad.error}`);
-      console.log('[Kick] Subscribed to chat.message.sent');
-    } else {
-      console.log('[Kick] Already subscribed to chat.message.sent');
-    }
-
-    if (activeAdapters.kick.token !== token) return; // cancelled meanwhile
-    const subBadges = await kickChannelSubBadges(clean);
-    if (activeAdapters.kick.token !== token) return;
-    activeAdapters.kick.instance = { broadcasterId, slug: clean, subBadges };
-    updatePlatformStatus('kick', 'connected', clean);
-  } catch (err) {
-    console.error('[Kick] Connect failed:', err?.message || err);
-    if (activeAdapters.kick.token === token) updatePlatformStatus('kick', 'error', clean, String(err?.message || err));
-  }
-}
-
-async function getKickPublicKey(refresh = false) {
-  if (kickPublicKeyPem && !refresh) return kickPublicKeyPem;
-  const j = await kickApi('GET', '/public-key');
-  kickPublicKeyPem = j?.data?.public_key;
-  if (!kickPublicKeyPem) throw new Error('Kick public key missing in response');
-  return kickPublicKeyPem;
-}
-
-// The signed payload is `${id}.${timestamp}.${rawBody}`. The body is appended
-// as the exact received bytes (no utf8 round-trip) so the signature matches.
-function kickSignatureValid(headers, rawBody, pem) {
-  const id = headers['kick-event-message-id'];
-  const ts = headers['kick-event-message-timestamp'];
-  const sig = headers['kick-event-signature'];
-  if (!id || !ts || !sig) return false;
-  const key = crypto.createPublicKey(pem);
-  const data = Buffer.concat([Buffer.from(`${id}.${ts}.`), rawBody]);
-  const algo = key.asymmetricKeyType === 'ed25519' ? null : 'RSA-SHA256'; // RSA or Ed25519
-  return crypto.verify(algo, data, key, Buffer.from(sig, 'base64'));
-}
-
-async function handleKickWebhook(req, res) {
-  try {
-    const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
-    let ok = false;
-    try {
-      ok = kickSignatureValid(req.headers, raw, await getKickPublicKey());
-      if (!ok) ok = kickSignatureValid(req.headers, raw, await getKickPublicKey(true)); // key rotation
-    } catch (err) {
-      console.error('[Kick Webhook] Signature check error:', err?.message || err);
-    }
-    if (!ok) {
-      console.warn('[Kick Webhook] Rejected: bad signature');
-      return res.status(401).end();
-    }
-
-    res.status(200).end(); // answer fast: Kick unsubscribes after failed deliveries
-
-    if (req.headers['kick-event-type'] !== 'chat.message.sent') return;
-    if (kickSeen(req.headers['kick-event-message-id'])) return;
-
-    const p = JSON.parse(raw.toString('utf8'));
-    const active = activeAdapters.kick.instance;
-    if (!active || Number(p.broadcaster?.user_id) !== active.broadcasterId) return;
-
-    const kickBadges = (p.sender?.identity?.badges || []).map((b) => {
-      const count = Number.isFinite(b.count) && b.count > 0 ? b.count : 0;
-      const isSub = String(b.type).toLowerCase() === 'subscriber';
-      return {
-        type: b.type,
-        label: `${b.text || b.type}${count ? ` ${count}` : ''}`,
-        url: (isSub && kickSubBadgeUrl(active.subBadges, count)) || kickBadgeIcon(b.type, count)
-      };
-    });
-
-    broadcastMessage(
-      normalizeMessage('kick', p.sender?.username, p.content, p.sender?.profile_picture || '', p.message_id ? `kick-${p.message_id}` : null, kickBadges)
-    );
-  } catch (err) {
-    console.error('[Kick Webhook] Error:', err);
-    if (!res.headersSent) res.status(200).end();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 5. Rumble: official Live Stream API (polled). Works for YOUR OWN channel
-// only and only while you are live. Get the URL at
-// rumble.com/account/livestream-api (it contains your secret key). Paste the
-// full URL (or just the key) into the dashboard, or put it in env
-// RUMBLE_API_URL and type "env" as the handle. The URL/key is never stored in
-// the status `handle`, so it is not broadcast to overlay viewers.
-// ---------------------------------------------------------------------------
-const RUMBLE_POLL_MS = 4000;
-
-function resolveRumbleUrl(input) {
-  let v = String(input || '').trim();
-  if (v.toLowerCase() === 'env') v = process.env.RUMBLE_API_URL || process.env.RUMBLE_API_KEY || '';
-  if (!v) return null;
-  try {
-    let u;
-    if (/^https?:\/\//i.test(v)) {
-      u = new URL(v);
-    } else if (/^[\w-]{8,}$/.test(v)) {
-      u = new URL('https://rumble.com/-livestream-api/get-data');
-      u.searchParams.set('key', v);
-    } else {
-      return null;
-    }
-    const hostOk = u.hostname === 'rumble.com' || u.hostname.endsWith('.rumble.com');
-    return u.protocol === 'https:' && hostOk ? u : null; // blocks requests to other hosts
-  } catch {
-    return null;
-  }
-}
-
-async function connectRumble(input) {
-  disconnectPlatform('rumble');
-  const url = resolveRumbleUrl(input);
-  if (!url) {
-    return updatePlatformStatus('rumble', 'error', '', 'Paste your Rumble Live Stream API URL (rumble.com/account/livestream-api) or key');
-  }
-
-  const token = Symbol('rumble');
-  activeAdapters.rumble.token = token;
-  updatePlatformStatus('rumble', 'connecting', 'Rumble');
-
-  const isSeen = makeSeen(2000);
-  let firstPoll = true;
-  let failures = 0;
-  let wasLive = null;
-  const current = () => activeAdapters.rumble.token === token;
-
-  const poll = async () => {
-    if (!current()) return;
-    let delay = RUMBLE_POLL_MS;
-    try {
-      // redirect:'error' keeps the secret key from being forwarded to another host.
-      const res = await fetch(url, { headers: { Accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
-      if ([401, 403, 404].includes(res.status)) {
-        // Wrong or revoked key: retrying will not help.
-        return updatePlatformStatus('rumble', 'error', '', `Rumble rejected the API key (HTTP ${res.status}). Reset it at rumble.com/account/livestream-api`);
-      }
-      if (!res.ok) throw new Error(`Rumble API returned HTTP ${res.status}`);
-      const data = await res.json();
-      if (!current()) return;
-
-      failures = 0;
-      if (activeAdapters.rumble.status !== 'connected') {
-        updatePlatformStatus('rumble', 'connected', data.username || 'Rumble');
-      }
-
-      const streams = Array.isArray(data.livestreams) ? data.livestreams : [];
-      const stream = streams.find((s) => s?.is_live) || streams[0];
-      const live = Boolean(stream?.is_live);
-      if (live !== wasLive) {
-        console.log(`[Rumble] ${live ? 'Stream is live' : 'No live stream right now (chat only appears while live)'}`);
-        wasLive = live;
-      }
-
-      const chat = stream?.chat || {};
-      const items = [
-        ...(chat.recent_messages || []).map((m) => ({ ...m, _rant: false })),
-        ...(chat.recent_rants || []).map((m) => ({ ...m, _rant: true }))
-      ].sort((a, b) => String(a.created_on || '').localeCompare(String(b.created_on || '')));
-
-      for (const m of items) {
-        const id = `rumble-${m._rant ? 'rant-' : ''}${m.id ?? `${m.username}-${m.created_on}-${m.text}`}`;
-        if (isSeen(id)) continue;
-        if (firstPoll) continue; // existing backlog: remember it, do not replay it
-        if (!m.text && !m._rant) continue;
-
-        let text = m.text || '';
-        if (m._rant) {
-          const dollars = m.amount_dollars ?? (m.amount_cents != null ? m.amount_cents / 100 : null);
-          text = `\u{1F4B0} Rant${dollars != null ? ` $${Number(dollars).toFixed(2)}` : ''}${text ? `: ${text}` : ''}`;
-        }
-        broadcastMessage(normalizeMessage('rumble', m.username, text, '', id, m.badges));
-      }
-      firstPoll = false;
-    } catch (err) {
-      failures += 1;
-      console.error(`[Rumble] Poll failed (${failures}):`, err?.message || err);
-      delay = Math.min(RUMBLE_POLL_MS * 2 ** Math.min(failures, 3), 30000);
-      if (failures === 3 && current()) updatePlatformStatus('rumble', 'error', '', `Rumble API unreachable: ${err?.message || err}`);
-    }
-    if (current()) activeAdapters.rumble.timer = setTimeout(poll, delay);
-  };
-
-  poll();
-}
-
-// ---------------------------------------------------------------------------
-// Disconnect
-// ---------------------------------------------------------------------------
-function disconnectPlatform(platform, { silent = false } = {}) {
-  const a = activeAdapters[platform];
-  if (!a) return;
-
-  clearTimeout(a.retry);
-  clearTimeout(a.timer);
-  try { a.instance?.stop?.(); } catch {}
-  try { a.process?.kill('SIGTERM'); } catch {}
-  try { a.client?.disconnect?.()?.catch?.(() => {}); } catch {}
-
-  activeAdapters[platform] = blankAdapter();
-  if (!silent) updatePlatformStatus(platform, 'disconnected');
-}
-// ---------------------------------------------------------------------------
-// Health + unified chat API for Synchra
-// ---------------------------------------------------------------------------
-
-// Render health check. This also confirms that the Node process is serving HTTP.
-app.get('/healthz', (_req, res) => {
-  res.status(200).json({ ok: true, service: 'malikgpt-unified-chat' });
+server.listen(PORT, () => {
+  console.log(`[Server] Running on port ${PORT}`);
 });
-
-// Synchra polls this endpoint to display messages from connected platforms.
-// Message fields match the widget: id, platform, username, message, at.
-app.get('/api/chat/recent', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-store, max-age=0');
-
-  const parsedLimit = Number.parseInt(String(req.query.limit ?? '60'), 10);
-  const limit = Number.isFinite(parsedLimit)
-    ? Math.min(Math.max(parsedLimit, 1), RECENT_CHAT_MAX)
-    : RECENT_CHAT_MAX;
-
-  res.status(200).json(recentChat.slice(-limit).map((m) => ({
-    id: String(m.id),
-    platform: String(m.platform || 'unknown'),
-    username: String(m.username || 'Viewer'),
-    message: String(m.message || ''),
-    at: Number(m.at) || Date.now()
-  })));
-});
-
-app.options('/api/chat/recent', (_req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.sendStatus(204);
-});
-
-// ---------------------------------------------------------------------------
-// Start the HTTP + Socket.IO server. Without this, Render can report that the
-// application exited after adapter/webhook initialization.
-// ---------------------------------------------------------------------------
-
-server.on('error', (err) => {
-  console.error('[Server] HTTP server error:', err);
-});
-
-server.listen(Number(PORT), '0.0.0.0', () => {
-  console.log(`[Server] Listening on port ${PORT}`);
-  console.log('[Health] GET /healthz');
-  console.log('[Chat API] GET /api/chat/recent');
-});
-
-// Gracefully close connections when Render stops or restarts the service.
-function shutdown(signal) {
-  console.log(`[Server] ${signal} received; shutting down`);
-  for (const platform of PLATFORMS) {
-    try {
-      disconnectPlatform(platform, { silent: true });
-    } catch (err) {
-      console.error(`[Server] Failed to disconnect ${platform}:`, err);
-    }
-  }
-
-  // Socket.IO closes its clients and the underlying HTTP server.
-  try {
-    io.close((err) => {
-      if (err) {
-        console.error('[Server] Error while closing Socket.IO:', err);
-        process.exitCode = 1;
-      }
-    });
-  } catch (err) {
-    console.error('[Server] Error while closing Socket.IO:', err);
-    process.exitCode = 1;
-  }
-}
-
-process.once('SIGTERM', () => shutdown('SIGTERM'));
-process.once('SIGINT', () => shutdown('SIGINT'));
