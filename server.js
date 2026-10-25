@@ -1958,3 +1958,81 @@ function disconnectPlatform(platform, { silent = false } = {}) {
   activeAdapters[platform] = blankAdapter();
   if (!silent) updatePlatformStatus(platform, 'disconnected');
 }
+// ---------------------------------------------------------------------------
+// Health + unified chat API for Synchra
+// ---------------------------------------------------------------------------
+
+// Render health check. This also confirms that the Node process is serving HTTP.
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({ ok: true, service: 'malikgpt-unified-chat' });
+});
+
+// Synchra polls this endpoint to display messages from connected platforms.
+// Message fields match the widget: id, platform, username, message, at.
+app.get('/api/chat/recent', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+
+  const parsedLimit = Number.parseInt(String(req.query.limit ?? '60'), 10);
+  const limit = Number.isFinite(parsedLimit)
+    ? Math.min(Math.max(parsedLimit, 1), RECENT_CHAT_MAX)
+    : RECENT_CHAT_MAX;
+
+  res.status(200).json(recentChat.slice(-limit).map((m) => ({
+    id: String(m.id),
+    platform: String(m.platform || 'unknown'),
+    username: String(m.username || 'Viewer'),
+    message: String(m.message || ''),
+    at: Number(m.at) || Date.now()
+  })));
+});
+
+app.options('/api/chat/recent', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.sendStatus(204);
+});
+
+// ---------------------------------------------------------------------------
+// Start the HTTP + Socket.IO server. Without this, Render can report that the
+// application exited after adapter/webhook initialization.
+// ---------------------------------------------------------------------------
+
+server.on('error', (err) => {
+  console.error('[Server] HTTP server error:', err);
+});
+
+server.listen(Number(PORT), '0.0.0.0', () => {
+  console.log(`[Server] Listening on port ${PORT}`);
+  console.log('[Health] GET /healthz');
+  console.log('[Chat API] GET /api/chat/recent');
+});
+
+// Gracefully close connections when Render stops or restarts the service.
+function shutdown(signal) {
+  console.log(`[Server] ${signal} received; shutting down`);
+  for (const platform of PLATFORMS) {
+    try {
+      disconnectPlatform(platform, { silent: true });
+    } catch (err) {
+      console.error(`[Server] Failed to disconnect ${platform}:`, err);
+    }
+  }
+
+  // Socket.IO closes its clients and the underlying HTTP server.
+  try {
+    io.close((err) => {
+      if (err) {
+        console.error('[Server] Error while closing Socket.IO:', err);
+        process.exitCode = 1;
+      }
+    });
+  } catch (err) {
+    console.error('[Server] Error while closing Socket.IO:', err);
+    process.exitCode = 1;
+  }
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
