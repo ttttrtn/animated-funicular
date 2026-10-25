@@ -56,6 +56,12 @@ function requireAuth(req, res, next) {
   res.set('WWW-Authenticate', 'Basic realm="Dashboard"').sendStatus(401);
 }
 // Protected: dashboard page + every /api route. Public: webhook, overlay, icons, static assets.
+// Public read-only feed for the stream widget (Synchra runs on another origin).
+app.get('/api/chat/recent', (_req, res) => {
+  res.set({ 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+  res.json(recentChat);
+});
+
 app.use((req, res, next) =>
   (req.path.startsWith('/api/') || req.path === '/' || req.path === '/index.html')
     ? requireAuth(req, res, next) : next());
@@ -95,10 +101,15 @@ function normalizeMessage(platform, username, message, avatar = '', id = null) {
   };
 }
 
+const RECENT_CHAT_MAX = 60;
+const recentChat = [];
+
 function broadcastMessage(msg) {
   const ic = settings.channelIconUrl;
   if (ic) msg.channelIcon = ic;
   io.emit('chatMessage', msg);
+  recentChat.push({ id: msg.id, platform: msg.platform, username: msg.username, message: msg.message, at: Date.now() });
+  if (recentChat.length > RECENT_CHAT_MAX) recentChat.splice(0, recentChat.length - RECENT_CHAT_MAX);
 }
 
 function snapshot(platform) {
