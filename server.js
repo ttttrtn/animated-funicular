@@ -89,6 +89,67 @@ require('./adapters/xwebhook').init({
   broadcastMessage: (m) => broadcastMessage(m)
 });
 
+// ---------------------------------------------------------------------------
+// Instagram live chat via Meta webhook (field: live_comments).
+//   env INSTAGRAM_VERIFY_TOKEN = any made-up word (also typed into Meta)
+//   env INSTAGRAM_APP_SECRET   = already used for the Instagram login
+//   env META_APP_SECRET        = optional, only if Meta signs with a different secret
+//   Callback URL in Meta: https://YOUR-HOST/webhooks/instagram
+// Comments go through broadcastMessage, so they reach the normal overlay AND
+// /api/chat/recent (the Synchra widget).
+// ---------------------------------------------------------------------------
+const IG_VERIFY_TOKEN = process.env.INSTAGRAM_VERIFY_TOKEN || '';
+const IG_SECRETS = [process.env.INSTAGRAM_APP_SECRET, process.env.META_APP_SECRET].filter(Boolean);
+const igSeen = makeSeen(1000);
+
+// Meta's "is this really your server?" check
+app.get('/webhooks/instagram', (req, res) => {
+  if (
+    IG_VERIFY_TOKEN &&
+    req.query['hub.mode'] === 'subscribe' &&
+    req.query['hub.verify_token'] === IG_VERIFY_TOKEN
+  ) {
+    return res.status(200).send(String(req.query['hub.challenge']));
+  }
+  res.sendStatus(403);
+});
+
+// Live comments arrive here
+app.post('/webhooks/instagram', express.raw({ type: '*/*', limit: '200kb' }), (req, res) => {
+  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+  const header = String(req.headers['x-hub-signature-256'] || '');
+  const ok = IG_SECRETS.some((secret) => {
+    const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');
+    return header.length === expected.length && crypto.timingSafeEqual(Buffer.from(header), Buffer.from(expected));
+  });
+  if (!ok) {
+    console.warn('[Instagram Webhook] Rejected: bad signature (check INSTAGRAM_APP_SECRET / META_APP_SECRET)');
+    return res.sendStatus(403);
+  }
+  res.sendStatus(200); // answer Meta fast
+
+  let body;
+  try { body = JSON.parse(raw.toString('utf8')); } catch { return; }
+
+  for (const entry of body?.entry || []) {
+    // Meta uses two slightly different shapes, so both are handled
+    const changes = entry.changes || (entry.field ? [{ field: entry.field, value: entry.value }] : []);
+    for (const change of changes) {
+      if (change.field !== 'live_comments') continue;
+      const v = change.value || {};
+      const id = v.comment_id || v.id;
+      const text = v.text;
+      if (!id || !text || igSeen(`instagram-${id}`)) continue;
+      const username = v.from?.username || 'instagram';
+      try {
+        broadcastMessage(normalizeMessage('instagram', username, text, '', `instagram-${id}`));
+      } catch (err) {
+        console.error('[Instagram Webhook] broadcast failed:', err);
+      }
+    }
+  }
+});
+
 // Uploaded channel icon (kept in memory; raw bytes so it must come before the JSON parser).
 const ICON_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 let uploadedIcon = null; // { buf, type, v }
@@ -178,10 +239,19 @@ function normalizeMessage(platform, username, message, avatar = '', id = null, b
 const settings = { showChannelIcon: false, tiktokEnabled: true, channelIconUrl: '' };
 let twitchChannelIcon = '';
 const viewerCounts = {};
+
+// Last chat messages from EVERY platform. The Synchra widget reads them from
+// GET /api/chat/recent. Usernames and text are stored exactly as broadcast
+// (already HTML-escaped by normalizeMessage); the widget decodes them.
+const RECENT_CHAT_MAX = 60;
+const recentChat = [];
+
 function broadcastMessage(msg) {
   if (msg.platform === 'tiktok' && !settings.tiktokEnabled) return;
   if (msg.platform === 'twitch') { const ic = settings.channelIconUrl || twitchChannelIcon; if (ic) msg.channelIcon = ic; }
   io.emit('chatMessage', msg);
+  recentChat.push({ id: msg.id, platform: msg.platform, username: msg.username, message: msg.message, at: Date.now() });
+  if (recentChat.length > RECENT_CHAT_MAX) recentChat.splice(0, recentChat.length - RECENT_CHAT_MAX);
 }
 
 // For status "error" the message is also sent in `handle` so existing
@@ -1887,253 +1957,4 @@ function disconnectPlatform(platform, { silent = false } = {}) {
 
   activeAdapters[platform] = blankAdapter();
   if (!silent) updatePlatformStatus(platform, 'disconnected');
-}
-
-// ---------------------------------------------------------------------------
-// API
-// ---------------------------------------------------------------------------
-// Dashboard key removed: the API is open. Put the app behind your own protection if the URL is public.
-function requireAuth(_req, _res, next) { next(); }
-
-// X, Facebook and Instagram live in adapters/ (see the comment at the top of each file).
-// X chat is also available through the official Activity API webhook (adapters/xwebhook.js).
-const adapterCtx = { activeAdapters, updatePlatformStatus, normalizeMessage, broadcastMessage, makeSeen, disconnectPlatform };
-const xAdapter = require('./adapters/x').init(adapterCtx);
-const fbAdapter = require('./adapters/facebook').init(adapterCtx);
-const igAdapter = require('./adapters/instagram').init(adapterCtx);
-
-// ---- Settings, channel icon, viewer counts, Twitch login -------------------
-const twitchHelix = async (p) => fetch('https://api.twitch.tv/helix/' + p, {
-  headers: { Authorization: `Bearer ${await twitchAppToken()}`, 'Client-Id': TWITCH_CLIENT_ID }, signal: AbortSignal.timeout(8000)
-}).then((r) => r.json());
-
-async function fetchTwitchIcon(chan) {
-  try {
-    let url = '';
-    if (TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET) url = (await twitchHelix(`users?login=${chan}`)).data?.[0]?.profile_image_url || '';
-    if (!url) { const j = await fetch(`https://api.ivr.fi/v2/twitch/user?login=${chan}`, { signal: AbortSignal.timeout(8000) }).then((r) => r.json()); url = j?.[0]?.logo || ''; }
-    twitchChannelIcon = /^https:\/\//.test(url) ? url : '';
-  } catch (e) { console.warn('[Twitch] channel icon failed:', e.message); }
-}
-
-const manualViewers = {}; // platforms with no usable viewer API (Instagram etc.): typed in on the dashboard
-async function pollViewers() {
-  const next = {};
-  const tw = activeAdapters.twitch, kk = activeAdapters.kick;
-  if (tw.status === 'connected' && tw.handle) {
-    try {
-      if (TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET) next.twitch = (await twitchHelix(`streams?user_login=${tw.handle}`)).data?.[0]?.viewer_count ?? 0;
-      else { const j = await fetch(`https://api.ivr.fi/v2/twitch/user?login=${tw.handle}`, { signal: AbortSignal.timeout(8000) }).then((r) => r.json()); next.twitch = j?.[0]?.stream?.viewersCount ?? 0; }
-    } catch {}
-  }
-  if (kk.status === 'connected' && kk.handle) {
-    try { const j = await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(kk.handle)}`, { signal: AbortSignal.timeout(8000), headers: { 'User-Agent': 'Mozilla/5.0' } }).then((r) => r.json()); next.kick = j?.livestream?.viewer_count ?? 0; } catch {}
-  }
-  for (const k of Object.keys(viewerCounts)) delete viewerCounts[k];
-  Object.assign(viewerCounts, next, manualViewers);
-  io.emit('viewerCounts', viewerCounts);
-}
-setInterval(() => pollViewers().catch(() => {}), 30000).unref();
-
-app.post('/api/viewers', (req, res) => {
-  const { platform, count } = req.body || {};
-  if (!PLATFORMS.includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
-  const n = Math.floor(Number(count));
-  if (Number.isFinite(n) && n > 0) manualViewers[platform] = Math.min(n, 1e9); else { delete manualViewers[platform]; delete viewerCounts[platform]; }
-  Object.assign(viewerCounts, manualViewers);
-  io.emit('viewerCounts', viewerCounts);
-  res.json({ success: true });
-});
-app.get('/api/settings', (_req, res) => res.json(settings));
-app.post('/api/settings', (req, res) => {
-  const b = req.body || {};
-  if (typeof b.showChannelIcon === 'boolean') settings.showChannelIcon = b.showChannelIcon;
-  if (typeof b.tiktokEnabled === 'boolean') { settings.tiktokEnabled = b.tiktokEnabled; if (!b.tiktokEnabled) disconnectPlatform('tiktok'); }
-  io.emit('settings', settings);
-  res.json(settings);
-});
-
-const twitchStates = new Set();
-const twitchRedirect = (req) => `${process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`}/auth/twitch/callback`;
-app.get('/auth/twitch', (req, res) => {
-  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET) return res.status(400).send('Set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET first.');
-  const state = crypto.randomBytes(12).toString('hex'); twitchStates.add(state);
-  res.redirect('https://id.twitch.tv/oauth2/authorize?' + new URLSearchParams({ client_id: TWITCH_CLIENT_ID, redirect_uri: twitchRedirect(req), response_type: 'code', scope: 'chat:read', state }));
-});
-app.get('/auth/twitch/callback', async (req, res) => {
-  try {
-    if (!twitchStates.delete(req.query.state)) throw new Error('bad state');
-    const t = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ client_id: TWITCH_CLIENT_ID, client_secret: TWITCH_CLIENT_SECRET, code: String(req.query.code), grant_type: 'authorization_code', redirect_uri: twitchRedirect(req) }) }).then((r) => r.json());
-    const u = await fetch('https://api.twitch.tv/helix/users', { headers: { Authorization: `Bearer ${t.access_token}`, 'Client-Id': TWITCH_CLIENT_ID } }).then((r) => r.json());
-    const login = u.data?.[0]?.login; if (!login) throw new Error('no user');
-    connectTwitch(login);
-    res.redirect('/?linked=twitch&name=' + encodeURIComponent(login));
-  } catch (e) { res.status(400).send('Twitch login failed: ' + e.message); }
-});
-
-// ---- Login for Kick (OAuth+PKCE), YouTube (Google) and TikTok: read the account's name, then use the existing chat connectors ----
-const OAUTH = {
-  kick: { id: 'KICK_CLIENT_ID', secret: 'KICK_CLIENT_SECRET', auth: 'https://id.kick.com/oauth/authorize', token: 'https://id.kick.com/oauth/token', scope: 'user:read channel:read', pkce: true,
-    async name(t) { const j = await fetch('https://api.kick.com/public/v1/channels', { headers: { Authorization: `Bearer ${t}` } }).then((r) => r.json()); return j.data?.[0]?.slug; } },
-  youtube: { id: 'GOOGLE_CLIENT_ID', secret: 'GOOGLE_CLIENT_SECRET', auth: 'https://accounts.google.com/o/oauth2/v2/auth', token: 'https://oauth2.googleapis.com/token', scope: 'https://www.googleapis.com/auth/youtube.readonly', extra: { access_type: 'online', prompt: 'select_account' },
-    async name(t) { const j = await fetch('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', { headers: { Authorization: `Bearer ${t}` } }).then((r) => r.json()); return j.items?.[0]?.snippet?.customUrl; } },
-  instagram: { id: 'INSTAGRAM_APP_ID', secret: 'INSTAGRAM_APP_SECRET', auth: 'https://www.instagram.com/oauth/authorize', token: 'https://api.instagram.com/oauth/access_token', scope: 'instagram_business_basic',
-    async name(t) { const j = await fetch(`https://graph.instagram.com/me?fields=username&access_token=${encodeURIComponent(t)}`).then((r) => r.json()); return j.username ? '@' + j.username : ''; } }
-};
-const oauthStates = new Map(); // state -> { p, verifier }
-const oauthRedirect = (req, p) => `${process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`}/auth/${p}/callback`;
-for (const p of Object.keys(OAUTH)) {
-  const o = OAUTH[p];
-  app.get(`/auth/${p}`, (req, res) => {
-    if (!process.env[o.id] || !process.env[o.secret]) return res.status(400).send(`Set ${o.id} and ${o.secret} first.`);
-    const state = crypto.randomBytes(12).toString('hex'), verifier = crypto.randomBytes(32).toString('base64url');
-    oauthStates.set(state, { p, verifier });
-    const q = { [o.idParam || 'client_id']: process.env[o.id], redirect_uri: oauthRedirect(req, p), response_type: 'code', scope: o.scope, state, ...(o.extra || {}) };
-    if (o.pkce) Object.assign(q, { code_challenge: crypto.createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256' });
-    res.redirect(o.auth + '?' + new URLSearchParams(q));
-  });
-  app.get(`/auth/${p}/callback`, async (req, res) => {
-    try {
-      const st = oauthStates.get(req.query.state); oauthStates.delete(req.query.state);
-      if (!st || st.p !== p) throw new Error('bad state');
-      const body = { [o.idParam || 'client_id']: process.env[o.id], client_secret: process.env[o.secret], code: String(req.query.code), grant_type: 'authorization_code', redirect_uri: oauthRedirect(req, p) };
-      if (o.pkce) body.code_verifier = st.verifier;
-      const t = await fetch(o.token, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(body) }).then((r) => r.json());
-      if (!t.access_token && t.data?.[0]?.access_token) t.access_token = t.data[0].access_token;
-      if (!t.access_token) throw new Error(t.error_description || t.error || 'no token');
-      const name = await o.name(t.access_token);
-      if (!name) throw new Error('could not read the account name (check scopes / that the account has a channel)');
-      Promise.resolve(connectors[p](name)).catch((e) => console.error(`[${p}] connect crashed:`, e));
-      res.redirect(`/?linked=${p}&name=${encodeURIComponent(name)}`);
-    } catch (e) { res.status(400).send(`${p} login failed: ${e.message}`); }
-  });
-}
-
-const connectors = {
-  youtube: connectYouTube,
-  tiktok: connectTikTok,
-  twitch: connectTwitch,
-  kick: connectKick,
-  facebook: fbAdapter.connectFacebook,
-  rumble: connectRumble,
-  x: xAdapter.connectX,
-  instagram: igAdapter.connectInstagram
-};
-
-app.post('/api/connect', requireAuth, (req, res) => {
-  const { platform, handle } = req.body || {};
-  const connect = Object.prototype.hasOwnProperty.call(connectors, platform) ? connectors[platform] : null;
-  if (!connect) return res.status(400).json({ error: 'Unsupported platform' });
-  if (typeof handle !== 'string' || !handle.trim() || handle.length > 200) {
-    return res.status(400).json({ error: 'Missing or invalid handle' });
-  }
-  Promise.resolve(connect(handle.trim())).catch((err) => console.error(`[${platform}] connect crashed:`, err));
-  res.json({ success: true });
-});
-
-// Kept for the dashboard's Instagram login button. Instagram runs in official-API
-// mode now, so openLogin does nothing and just reports success.
-app.post('/api/instagram/login', requireAuth, (_req, res) => {
-  Promise.resolve(igAdapter.openLogin?.())
-    .then(() => res.json({ success: true }))
-    .catch((err) => res.status(500).json({ error: String(err?.message || err) }));
-});
-
-app.post('/api/disconnect', requireAuth, (req, res) => {
-  const { platform } = req.body || {};
-  if (!PLATFORMS.includes(platform)) return res.status(400).json({ error: 'Unsupported platform' });
-  disconnectPlatform(platform);
-  res.json({ success: true });
-});
-
-app.get('/api/status', (_req, res) => {
-  const summary = {};
-  PLATFORMS.forEach((p) => {
-    const { status, handle, error } = snapshot(p);
-    summary[p] = { status, handle, error };
-  });
-  res.json(summary);
-});
-
-app.get('/health', (_req, res) => res.status(200).send('OK'));
-
-// ---------------------------------------------------------------------------
-// Overlay URL config:
-//   /overlay.html?twitch=NAME&kick=NAME&youtube=@HANDLE&tiktok=NAME&rumble=URL
-// The overlay page sends these over the socket and the server connects them.
-// Reloading the overlay never restarts a platform already running for the same
-// value, and changes are rate-limited because this endpoint has no password.
-// Optional: set env OVERLAY_KEY and add &key=THAT_VALUE to require it.
-// ---------------------------------------------------------------------------
-const OVERLAY_PLATFORMS = ['twitch', 'kick', 'youtube', 'tiktok', 'rumble', 'x', 'facebook', 'instagram'];
-// These use server-side credentials or open a window, so they only start from an
-// overlay URL when OVERLAY_KEY is set (and the URL carries &key=...).
-const OVERLAY_KEY_REQUIRED = new Set(['facebook', 'instagram']);
-const OVERLAY_COOLDOWN_MS = 15000;
-const overlayState = {}; // platform -> { fp, at }
-
-function applyOverlayConfig(cfg) {
-  if (!cfg || typeof cfg !== 'object') return;
-  if (process.env.OVERLAY_KEY) {
-    const given = typeof cfg.key === 'string' ? cfg.key : '';
-    if (!safeEqual(given, process.env.OVERLAY_KEY)) return;
-  }
-  for (const p of OVERLAY_PLATFORMS) {
-    const raw = cfg[p];
-    if (typeof raw !== 'string' || !raw.trim() || raw.length > 400) continue;
-    if (OVERLAY_KEY_REQUIRED.has(p) && !process.env.OVERLAY_KEY) {
-      if (!overlayState[`warn-${p}`]) { overlayState[`warn-${p}`] = true; console.warn(`[Overlay] ${p} from the overlay URL is ignored: set OVERLAY_KEY and add &key=... to allow it`); }
-      continue;
-    }
-    const handle = raw.trim();
-    const fp = crypto.createHash('sha256').update(handle).digest('hex');
-    const prev = overlayState[p];
-    const status = activeAdapters[p].status;
-
-    if (prev && prev.fp === fp && (status === 'connecting' || status === 'connected')) continue;
-    if (prev && Date.now() - prev.at < OVERLAY_COOLDOWN_MS) continue;
-
-    overlayState[p] = { fp, at: Date.now() };
-    console.log(`[Overlay] Connecting ${p} from overlay URL`); // never log the value (Rumble URLs contain a key)
-    Promise.resolve(connectors[p](handle)).catch((err) => console.error(`[${p}] connect crashed:`, err));
-  }
-}
-
-io.on('connection', (socket) => {
-  PLATFORMS.forEach((p) => socket.emit('statusUpdate', snapshot(p)));
-  socket.emit('settings', settings); socket.emit('viewerCounts', viewerCounts);
-  socket.on('overlayConnect', applyOverlayConfig);
-});
-
-// ---------------------------------------------------------------------------
-// Start / shutdown
-// ---------------------------------------------------------------------------
-function shutdown() {
-  console.log('Shutting down, stopping adapters...');
-  PLATFORMS.forEach((p) => disconnectPlatform(p, { silent: true }));
-  io.close();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 3000).unref();
-}
-
-// Internals exposed for the unit tests (harmless in production).
-module.exports = {
-  app,
-  server,
-  io,
-  _test: {
-    youTubeTargets, ytAnalyzeChatPage, ytParseChatResponse, ytExtractContinuation, ytExtractInitialData,
-    ytItemToEntry, ytActionsToEntries, ytFetch, createYtPoller, ytCfg, YtError, ytHttpError,
-    ytApiItemToEntry, ytCollectVideos, makeSeen, normalizeMessage, connectYouTube, activeAdapters,
-    ytDeadVideos, setInnertube: (o) => { ytClientPromise = Promise.resolve(o); }, ytChatStart, ytRetryDelay, disconnectPlatform, kickSignatureValid, resolveRumbleUrl, snapshot
-  }
-};
-
-if (require.main === module) {
-  server.listen(PORT, () => console.log(`MalikGPT Unified Chat live on port ${PORT} [build: platforms-v8]`));
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-  process.on('unhandledRejection', (err) => console.error('[Unhandled rejection]', err));
-  process.on('uncaughtException', (err) => console.error('[Uncaught exception]', err));
 }
