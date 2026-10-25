@@ -1,7 +1,6 @@
 const socket = io();
 const $ = (id) => document.getElementById(id);
 const on = (id, ev, fn) => { const el = $(id); if (el) el[ev] = fn; }; // tolerate elements missing from the HTML
-let lastStatus = null;
 
 const post = async (u, b) => {
   const r = await fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b || {}) });
@@ -9,36 +8,51 @@ const post = async (u, b) => {
   return r;
 };
 
+const NAMES = { instagram: 'INSTAGRAM', soop: 'SOOP' };
+const status = {};
+let saved = {};
+try { saved = JSON.parse(localStorage.getItem('chatdash') || '{}'); } catch {}
+
 function render() {
   const cards = $('cards');
   if (!cards) return;
-  cards.innerHTML = `
-    <div class="card" id="c-instagram">
-      <div class="ch"><img src="/icons/instagram.svg"><h3>INSTAGRAM</h3>
-        <span class="badge disconnected" id="s-instagram">offline</span></div>
+  cards.innerHTML = Object.keys(NAMES).map((p) => `
+    <div class="card" id="c-${p}">
+      <div class="ch"><img src="/icons/${p}.svg"><h3>${NAMES[p]}</h3>
+        <span class="badge disconnected" id="s-${p}">offline</span></div>
+      ${p === 'soop' ? `<input type="text" id="h-soop" placeholder="SOOP BJ id" value="${(saved.soop || '').replace(/"/g, '&quot;')}">` : ''}
       <div class="row">
-        <button class="btn primary" onclick="conn()">Connect</button>
-        <button class="btn" onclick="disc()">Disconnect</button>
+        <button class="btn primary" onclick="conn('${p}')">Connect</button>
+        <button class="btn" onclick="disc('${p}')">Disconnect</button>
       </div>
       <input type="number" min="0" placeholder="Viewers (type from the app, 0 = clear)"
-             onchange="post('/api/viewers',{platform:'instagram',count:this.value})">
-      <div class="err" id="e-instagram"></div>
-    </div>`;
-  if (lastStatus) paint(lastStatus);
+             onchange="post('/api/viewers',{platform:'${p}',count:this.value})">
+      <div class="err" id="e-${p}"></div>
+    </div>`).join('');
+  Object.values(status).forEach(paint);
 }
 
 function paint(d) {
-  const b = $('s-instagram');
-  if (!b || d.platform !== 'instagram') return;
+  const b = $('s-' + d.platform);
+  if (!b) return;
   b.textContent = d.status;
   b.className = 'badge ' + d.status;
-  $('e-instagram').textContent = d.status === 'error' ? (d.error || d.handle) : '';
+  $('e-' + d.platform).textContent = d.status === 'error' ? (d.error || d.handle) : '';
 }
 
-function conn() { post('/api/connect', { platform: 'instagram' }); }
-function disc() { post('/api/disconnect', { platform: 'instagram' }); }
+function conn(p) {
+  if (p === 'soop') {
+    const h = $('h-soop').value.trim();
+    if (!h) return alert('Enter the SOOP BJ id first');
+    saved.soop = h;
+    localStorage.setItem('chatdash', JSON.stringify(saved));
+    return post('/api/connect', { platform: 'soop', handle: h });
+  }
+  return post('/api/connect', { platform: p });
+}
+function disc(p) { post('/api/disconnect', { platform: p }); }
 
-on('allBtn', 'onclick', conn);
+on('allBtn', 'onclick', () => { conn('instagram'); if (saved.soop) conn('soop'); });
 on('clr', 'onclick', () => { $('feed').innerHTML = ''; });
 on('swIcon', 'onchange', (e) => post('/api/settings', { showChannelIcon: e.target.checked }));
 on('iconDel', 'onclick', () => fetch('/api/channel-icon', { method: 'DELETE' }));
@@ -58,7 +72,7 @@ document.querySelectorAll('[data-copy]').forEach((b) => {
   };
 });
 
-socket.on('statusUpdate', (d) => { lastStatus = d; paint(d); });
+socket.on('statusUpdate', (d) => { status[d.platform] = d; paint(d); });
 
 socket.on('settings', (s) => {
   const u = s.channelIconUrl;
