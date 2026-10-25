@@ -6,11 +6,13 @@ const http = require('http');
 const crypto = require('crypto');
 const path = require('path');
 const { Server } = require('socket.io');
+const { spawn } = require('child_process');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 const PORT = process.env.PORT || 3000;
+const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
 
 if (process.env.TRUST_PROXY) {
   app.set('trust proxy', /^\d+$/.test(process.env.TRUST_PROXY) ? Number(process.env.TRUST_PROXY) : process.env.TRUST_PROXY);
@@ -69,9 +71,9 @@ app.use((req, res, next) =>
 // ---------------------------------------------------------------------------
 // State & helpers
 // ---------------------------------------------------------------------------
-const PLATFORMS = ['instagram'];
+const PLATFORMS = ['instagram', 'soop'];
 const activeAdapters = Object.fromEntries(
-  PLATFORMS.map((p) => [p, { status: 'disconnected', handle: '', error: '', instance: null, token: null }])
+  PLATFORMS.map((p) => [p, { status: 'disconnected', handle: '', error: '', instance: null, token: null, process: null, retry: null }])
 );
 const settings = { showChannelIcon: false, channelIconUrl: '' };
 
@@ -128,9 +130,59 @@ function updatePlatformStatus(platform, status, handle = '', error = '') {
 function disconnectPlatform(p) {
   const a = activeAdapters[p];
   if (!a) return;
+  clearTimeout(a.retry);
+  if (a.process) { const proc = a.process; a.process = null; try { proc.kill(); } catch {} }
   if (a.instance?.stop) { try { a.instance.stop(); } catch {} }
   a.instance = null;
   a.token = null;
+}
+
+// Runs a Python bridge that prints JSON lines; auto-retries with backoff.
+const BRIDGE_MAX_RETRIES = 8;
+function startBridge(platform, script, arg, attempt = 0) {
+  const a = activeAdapters[platform];
+  clearTimeout(a.retry);
+  updatePlatformStatus(platform, 'connecting', arg);
+  console.log(`[${platform}] starting bridge for "${arg}" (attempt ${attempt + 1})`);
+
+  const proc = spawn(PYTHON_BIN, ['-u', path.join(__dirname, 'python', script), arg], {
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  a.process = proc;
+  const isCurrent = () => a.process === proc;
+  let fatal = false;
+  let buffer = '';
+
+  const handleLine = (line) => {
+    let p;
+    try { p = JSON.parse(line); } catch { return; }
+    if (!isCurrent()) return;
+    if (p.type === 'log') console.log(`[${platform} bridge] ${p.message}`);
+    else if (p.type === 'status') { if (p.status === 'connected') attempt = 0; updatePlatformStatus(platform, p.status, arg); }
+    else if (p.type === 'message') broadcastMessage(normalizeMessage(platform, p.username, p.message, p.avatar || '', p.id || null));
+    else if (p.type === 'error') { if (p.fatal) fatal = true; updatePlatformStatus(platform, 'error', arg, p.message); }
+  };
+
+  proc.stdout.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    lines.forEach(handleLine);
+  });
+  proc.stderr.on('data', (d) => console.error(`[${platform} stderr] ${d.toString().trimEnd()}`));
+  proc.on('error', (err) => {
+    if (isCurrent()) { fatal = true; updatePlatformStatus(platform, 'error', arg, `Cannot start Python (${err.code || err.message})`); }
+  });
+  proc.on('close', () => {
+    if (buffer.trim()) { handleLine(buffer); buffer = ''; }
+    if (!isCurrent()) return;
+    a.process = null;
+    if (a.status !== 'error') updatePlatformStatus(platform, 'disconnected');
+    if (!fatal && attempt < BRIDGE_MAX_RETRIES) {
+      a.retry = setTimeout(() => startBridge(platform, script, arg, attempt + 1), Math.min(2000 * 2 ** attempt, 60000));
+    }
+  });
 }
 
 const igSeen = makeSeen(1000); // shared by webhook + poller so nothing shows twice
@@ -210,8 +262,16 @@ app.use(express.json({ limit: '10kb' }));
 
 app.post('/api/connect', (req, res) => {
   const p = String(req.body?.platform || '').toLowerCase();
-  if (p !== 'instagram') return res.status(400).json({ error: 'Only Instagram is supported' });
-  instagram.connectInstagram();
+  if (p === 'instagram') {
+    instagram.connectInstagram();
+  } else if (p === 'soop') {
+    const handle = String(req.body?.handle || '').trim().slice(0, 60);
+    if (!/^[\w.-]+$/.test(handle)) return res.status(400).json({ error: 'Enter the SOOP BJ id (letters/numbers)' });
+    disconnectPlatform('soop');
+    startBridge('soop', 'soop_bridge.py', handle);
+  } else {
+    return res.status(400).json({ error: 'Unsupported platform' });
+  }
   res.json({ success: true });
 });
 
